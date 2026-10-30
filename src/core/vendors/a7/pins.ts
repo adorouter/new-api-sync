@@ -1,0 +1,593 @@
+import { fetchJson, tryFetchJson } from "@core/infra/http";
+import { resolvePerModel } from "@core/pricing";
+import { sanitizeGroupName } from "@core/catalog/constants/patterns";
+import { throwIfRunAborted } from "@core/infra/abort";
+import {
+  flushLaneKeys,
+  getLaneKey,
+  pruneLaneKeys,
+  putLaneKey,
+} from "@core/infra/lane-keys";
+import type { A7ProviderConfig } from "@core/validations/config";
+import {
+  type ClientContext,
+  makeClientContext,
+} from "@core/vendors/newapi/context";
+import {
+  createToken,
+  deleteToken,
+  getTokenFullKeysBatch,
+  listTokens,
+} from "@core/vendors/newapi/tokens";
+import {
+  awaitTokenThrottle,
+  noteTokenThrottle,
+} from "@core/vendors/newapi/token-throttle";
+import { consola } from "consola";
+import {
+  DEFAULT_MAX_SELL_FRACTION,
+  DEFAULT_PROFIT_MULTIPLE,
+  fetchListingsByModel,
+  marketplaceHeaders,
+  type Listing,
+} from "./marketplace";
+
+// A pin is per (token, model), so one token cannot route the same model to two
+// merchants. Multi-merchant channels therefore need one upstream token per
+// (model, merchant) pair, each carrying exactly one pin.
+export interface MerchantLane {
+  model: string;
+  listing: Listing;
+}
+
+export interface LaneToken {
+  key: string;
+  tokenId: number;
+  /** The key came from the lane key cache, not from a reveal this call. */
+  cached?: boolean;
+}
+
+interface PinRecord {
+  token_id: number;
+  channel_id: number;
+  model_name: string;
+  status?: string;
+  confirmed_output_price_micros?: number;
+  current_output_price_micros?: number;
+}
+
+interface PinsResponse {
+  success?: boolean;
+  data?: { items?: PinRecord[] } | PinRecord[];
+}
+
+const TOKEN_NAME_MAX_BYTES = 30;
+
+export function laneTokenName(lane: MerchantLane): string {
+  return laneTokenNameFor(lane.listing.channel_id, lane.model);
+}
+
+export function laneTokenNameFor(channelId: number, model: string): string {
+  const base = `${channelId}-${model}`;
+  const encoder = new TextEncoder();
+  if (encoder.encode(base).length <= TOKEN_NAME_MAX_BYTES) return base;
+  let out = "";
+  let used = 0;
+  for (const ch of base) {
+    const bytes = encoder.encode(ch).length;
+    if (used + bytes > TOKEN_NAME_MAX_BYTES) break;
+    out += ch;
+    used += bytes;
+  }
+  return out;
+}
+
+function clientContext(provider: A7ProviderConfig): ClientContext {
+  return makeClientContext(
+    provider.baseUrl.replace(/\/$/, ""),
+    marketplaceHeaders(provider),
+    provider.name,
+  );
+}
+
+const normalizeKey = (key: string) =>
+  key.startsWith("sk-") ? key : `sk-${key}`;
+const isMasked = (key: string) => key.includes("*");
+const laneNamePattern = /^\d+-/;
+
+export async function ensureLaneTokens(
+  provider: A7ProviderConfig,
+  lanes: MerchantLane[],
+  opts: { dryRun: boolean; forceReveal?: Set<string> },
+): Promise<Map<string, LaneToken>> {
+  const result = new Map<string, LaneToken>();
+  if (opts.dryRun) {
+    for (const lane of lanes)
+      result.set(laneTokenName(lane), { key: "", tokenId: 0 });
+    return result;
+  }
+
+  const ctx = clientContext(provider);
+  const existing = await listTokens(ctx);
+  const byName = new Map(existing.map((t) => [t.name, t]));
+  const desired = new Map(lanes.map((l) => [laneTokenName(l), l]));
+  pruneLaneKeys(provider.name, new Set(existing.map((t) => t.id)));
+
+  const maskedIds: number[] = [];
+  for (const [name] of desired) {
+    const token = byName.get(name);
+    if (!token) continue;
+    if (!isMasked(token.key)) {
+      const key = normalizeKey(token.key);
+      result.set(name, { key, tokenId: token.id });
+      putLaneKey(provider.name, token.id, name, key, "listed");
+      continue;
+    }
+    const held = opts.forceReveal?.has(name)
+      ? undefined
+      : getLaneKey(provider.name, token.id, name);
+    if (held) result.set(name, { key: held, tokenId: token.id, cached: true });
+    else maskedIds.push(token.id);
+  }
+  if (maskedIds.length > 0) {
+    consola.info(
+      `[${provider.name}] revealing ${maskedIds.length} masked lane key(s)`,
+    );
+    const revealed = await getTokenFullKeysBatch(ctx, maskedIds);
+    for (const [name] of desired) {
+      const token = byName.get(name);
+      if (!token || result.has(name)) continue;
+      const key = revealed.get(token.id);
+      if (!key) continue;
+      result.set(name, { key: normalizeKey(key), tokenId: token.id });
+      putLaneKey(provider.name, token.id, name, normalizeKey(key));
+    }
+  }
+
+  // a7's POST /api/token returns no key inline, so a newly created token is
+  // revealed the same way as an existing one: batch/keys after re-listing.
+  const createdIds: number[] = [];
+  const missing = [...desired.keys()].filter((n) => !result.has(n)).length;
+  if (missing > 0)
+    consola.info(`[${provider.name}] creating ${missing} lane token(s)`);
+  for (const [name] of desired) {
+    throwIfRunAborted();
+    if (result.has(name)) continue;
+    const created = await createToken(ctx, name, "default");
+    if (!created.ok)
+      consola.warn(`[${provider.name}] token create failed for lane ${name}`);
+  }
+  const afterCreate = new Map((await listTokens(ctx)).map((t) => [t.name, t]));
+  for (const [name] of desired) {
+    if (result.has(name)) continue;
+    const token = afterCreate.get(name);
+    if (token) createdIds.push(token.id);
+  }
+  if (createdIds.length > 0) {
+    const keys = await getTokenFullKeysBatch(ctx, createdIds);
+    for (const [name] of desired) {
+      if (result.has(name)) continue;
+      const token = afterCreate.get(name);
+      if (!token) continue;
+      const key = keys.get(token.id);
+      if (key) {
+        result.set(name, { key: normalizeKey(key), tokenId: token.id });
+        putLaneKey(provider.name, token.id, name, normalizeKey(key));
+      } else
+        consola.warn(`[${provider.name}] no key for lane ${name}, skipping`);
+    }
+  }
+
+  await flushLaneKeys(provider.name);
+  return result;
+}
+
+// Live gateway channel back to its merchant and exposed model. The group is
+// a7-<merchant slug>-<merchant id>-<sanitized model>; the model suffix is known,
+// the merchant id is the trailing digits before it.
+export function channelLane(ch: {
+  group?: string;
+  models: string;
+}): { channelId: number; exposed: string } | undefined {
+  const exposed = ch.models.split(",")[0]?.trim().toLowerCase();
+  if (!exposed || !ch.group) return undefined;
+  const suffix = `-${sanitizeGroupName(exposed)}`;
+  if (!ch.group.endsWith(suffix)) return undefined;
+  const id = /(\d+)$/.exec(ch.group.slice(0, -suffix.length))?.[1];
+  return id ? { channelId: Number(id), exposed } : undefined;
+}
+
+export function laneNameFromChannel(
+  ch: { group?: string; models: string },
+  marketByExposed: Map<string, string>,
+): string | undefined {
+  const lane = channelLane(ch);
+  const market = lane ? marketByExposed.get(lane.exposed) : undefined;
+  return lane && market ? laneTokenNameFor(lane.channelId, market) : undefined;
+}
+
+// Same rationale as cleanupEmptyGroupTokens: only a FULL provider run may
+// delete, or a filtered run conflates "merchant gone" with "filtered out"
+// and the deleted key 401-kills every out-of-scope channel still using it.
+// A candidate probed and rejected keeps its token: the next walk probes the
+// same merchant again, and a kept token is a cache hit while a recreated one
+// is a create plus a reveal under a7's throttle. Only merchants that fell
+// out of the candidate list lose their token (and thereby their pin).
+export async function cleanupStaleLaneTokens(
+  provider: A7ProviderConfig,
+  keptLanes: MerchantLane[],
+  probedLanes: MerchantLane[],
+  unverifiedModels: Set<string> = new Set(),
+): Promise<void> {
+  const ctx = clientContext(provider);
+  const keep = new Set([...keptLanes, ...probedLanes].map(laneTokenName));
+  // A token for a model the marketplace could not list this run is not stale:
+  // nothing was walked for it, so nothing can say its lane is gone.
+  const unverified = (name: string): boolean => {
+    const id = Number(/^(\d+)-/.exec(name)?.[1]);
+    if (!id) return false;
+    for (const model of unverifiedModels)
+      if (laneTokenNameFor(id, model) === name) return true;
+    return false;
+  };
+  for (const token of await listTokens(ctx)) {
+    throwIfRunAborted();
+    if (!laneNamePattern.test(token.name)) continue;
+    if (keep.has(token.name) || unverified(token.name)) continue;
+    if (await deleteToken(ctx, token.id))
+      consola.info(`[${provider.name}] deleted stale lane token ${token.name}`);
+  }
+}
+
+async function listPins(provider: A7ProviderConfig): Promise<PinRecord[]> {
+  return (await fetchPins(provider)) ?? [];
+}
+
+// null when a7 did not answer, so a caller can tell "no pins" from "unknown".
+async function fetchPins(
+  provider: A7ProviderConfig,
+): Promise<PinRecord[] | null> {
+  const url = `${provider.baseUrl.replace(/\/$/, "")}/api/marketplace/pins`;
+  const body = await tryFetchJson<PinsResponse>(url, {
+    headers: marketplaceHeaders(provider),
+    timeoutMs: 30_000,
+  });
+  if (!body?.success) return null;
+  const data = body.data;
+  return Array.isArray(data) ? data : (data?.items ?? []);
+}
+
+const laneSuffix = (name: string) => name.toLowerCase().replace(/\./g, "-");
+
+// A lane key whose pin is gone (merchant delisted, pin POST lost to a throttle)
+// is an ordinary a7 key: a7 smart-routes it to any merchant at that merchant's
+// price while the lane stays priced on the one we pinned. Nothing errors, so the
+// guard never sees it (claude-opus-5.5 on merchant 3119 ran at 1.4x instead of 5x
+// for a day). Such lanes are deleted; the next a7 sync re-pins and recreates them.
+// A deleted rather than disabled lane, because the gateway retest would pass
+// through smart routing and turn it straight back on.
+export async function retireUnpinnedLanes(
+  provider: A7ProviderConfig,
+  channels: { id?: number; name: string; tag?: string }[],
+  deleteChannel: (id: number) => Promise<boolean>,
+): Promise<{ retired: string[]; skipped?: string }> {
+  const pins = await fetchPins(provider);
+  if (pins === null) return { retired: [], skipped: "pin list unavailable" };
+  const pinnedTokens = new Set(pins.map((p) => p.token_id));
+  const unpinned = (await listTokens(clientContext(provider))).filter(
+    (t) => /^\d+-/.test(t.name) && !pinnedTokens.has(t.id),
+  );
+  const lanes = channels.filter((c) => c.tag === provider.name && c.id);
+  const doomed = lanes.filter((c) =>
+    unpinned.some((t) => laneSuffix(c.name).endsWith(`-${laneSuffix(t.name)}`)),
+  );
+  if (doomed.length > lanes.length / 4)
+    return {
+      retired: [],
+      skipped: `${doomed.length} of ${lanes.length} lanes unpinned, looks like an a7 glitch`,
+    };
+  const retired: string[] = [];
+  for (const c of doomed)
+    if (c.id && (await deleteChannel(c.id))) retired.push(c.name);
+  return { retired };
+}
+
+async function postPin(
+  provider: A7ProviderConfig,
+  tokenId: number,
+  channelId: number,
+  model: string,
+): Promise<void> {
+  await fetchJson(
+    `${provider.baseUrl.replace(/\/$/, "")}/api/marketplace/pin`,
+    {
+      method: "POST",
+      headers: {
+        ...marketplaceHeaders(provider),
+        "Content-Type": "application/json",
+      },
+      body: {
+        token_id: tokenId,
+        channel_id: channelId,
+        model_name: model,
+        // NO smart-routing fallback: a7 bills the fallback merchant's own price
+        // (seen 4.8x the pinned cost, can exceed our retail), and the
+        // successful-but-expensive responses hide the dead merchant from the
+        // failure-rate guard. An erroring lane fails over on our side to lanes
+        // whose cost we actually priced.
+        fallback_to_smart_routing: false,
+      },
+      timeoutMs: 30_000,
+      retry: 3,
+      retryDelayMs: 5000,
+    },
+  );
+}
+
+interface PriceNotice {
+  notice_id: number;
+  channel_id: number;
+  model_name: string;
+  status: string;
+  new_price?: { output_price_micros?: number };
+  relations?: {
+    relation_type: string;
+    relation_id: number;
+    token_id: number;
+    state: string;
+  }[];
+}
+
+interface PriceNoticesResponse {
+  success?: boolean;
+  data?: { items?: PriceNotice[] } | PriceNotice[];
+}
+
+// a7 PAUSES a pin whenever its merchant reprices (paused_price_changed) and,
+// with fallback off, the lane errors until the change is accepted. Re-POSTing
+// the pin does NOT accept (verified live); the accept is its own endpoint,
+// keyed by price notice + pin relation. Accept every open pin relation whose
+// new price is still profitable (new output * profitMultiple within
+// maxSellFraction of the official list); a merchant that repriced itself past
+// the ceiling stays paused so the failure-rate guard retires the lane. Runs
+// from `sync metadata` so the cadence is the cron's, not the full-sync's.
+export async function acceptPriceNotices(
+  provider: A7ProviderConfig,
+): Promise<{ accepted: number; leftPaused: number }> {
+  const result = { accepted: 0, leftPaused: 0 };
+  const base = provider.baseUrl.replace(/\/$/, "");
+  const body = await tryFetchJson<PriceNoticesResponse>(
+    `${base}/api/marketplace/price-notices`,
+    { headers: marketplaceHeaders(provider), timeoutMs: 30_000 },
+  );
+  if (!body?.success) return result;
+  const notices = Array.isArray(body.data)
+    ? body.data
+    : (body.data?.items ?? []);
+  if (notices.length === 0) return result;
+
+  const { byModel, failed: unreachable } = await fetchListingsByModel(
+    provider,
+    [...new Set(notices.map((n) => n.model_name))],
+  );
+  const unreachableModels = new Set(unreachable);
+  const officialOutByKey = new Map(
+    [...byModel.values()]
+      .flat()
+      .map((l) => [
+        `${l.channel_id}|${l.model_name}`,
+        l.official_price?.output_price_micros,
+      ]),
+  );
+
+  // a7 keeps notices for pins we have since deleted, and still marks their
+  // relation "open", so accepting one answers 400 relation_required forever
+  // (every 15 minutes, once per dead pin). A pin is ours only while it is in
+  // the live pin list; relations carry no pin id, so token_id is the join.
+  const ownPinTokenIds = new Set(
+    (await listPins(provider)).map((pin) => pin.token_id),
+  );
+
+  for (const notice of notices) {
+    for (const rel of notice.relations ?? []) {
+      if (rel.relation_type !== "pin" || rel.state !== "open") continue;
+      if (!ownPinTokenIds.has(rel.token_id)) continue;
+      throwIfRunAborted();
+      // Without the listing there is no official price to judge the new one
+      // against; the notice stays open for the next tick.
+      if (unreachableModels.has(notice.model_name)) {
+        result.leftPaused++;
+        continue;
+      }
+      const profitMultiple = resolvePerModel(
+        provider.profitMultiple,
+        notice.model_name,
+        DEFAULT_PROFIT_MULTIPLE,
+      );
+      const maxSellFraction = resolvePerModel(
+        provider.maxSellFraction,
+        notice.model_name,
+        DEFAULT_MAX_SELL_FRACTION,
+      );
+      const officialOut = officialOutByKey.get(
+        `${notice.channel_id}|${notice.model_name}`,
+      );
+      const newOut = notice.new_price?.output_price_micros;
+      if (
+        officialOut !== undefined &&
+        officialOut > 0 &&
+        newOut !== undefined &&
+        newOut * profitMultiple > officialOut * maxSellFraction
+      ) {
+        consola.warn(
+          `[${provider.name}] leaving pin paused for ${notice.model_name} -> ${notice.channel_id}: new price breaches the sell ceiling`,
+        );
+        result.leftPaused++;
+        continue;
+      }
+      try {
+        await fetchJson(
+          `${base}/api/marketplace/price-notices/${notice.notice_id}/accept`,
+          {
+            method: "POST",
+            headers: {
+              ...marketplaceHeaders(provider),
+              "Content-Type": "application/json",
+            },
+            body: { relation_type: "pin", relation_id: rel.relation_id },
+            timeoutMs: 30_000,
+          },
+        );
+        consola.info(
+          `[${provider.name}] accepted price change for ${notice.model_name} -> ${notice.channel_id}`,
+        );
+        result.accepted++;
+      } catch (err) {
+        consola.warn(
+          `[${provider.name}] price accept failed for ${notice.model_name} -> ${notice.channel_id}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  // Price DROPS never pause the pin and produce no acceptable notice, so an
+  // active pin keeps BILLING the old higher confirmed snapshot. Re-POSTing
+  // the pin does not refresh it either (verified live); only unpin + pin
+  // re-confirms at the current price. The ceiling still applies: a merchant
+  // dropping from far above the ceiling to just above it is still not worth
+  // re-pinning (3801 rode this to a 1.1x margin), so leave those to the full
+  // sync's cull instead of resurrecting them.
+  for (const pin of await listPins(provider)) {
+    if (pin.status !== "active") continue;
+    if (
+      pin.current_output_price_micros === undefined ||
+      pin.confirmed_output_price_micros === undefined ||
+      pin.current_output_price_micros >= pin.confirmed_output_price_micros
+    )
+      continue;
+    const profitMultiple = resolvePerModel(
+      provider.profitMultiple,
+      pin.model_name,
+      DEFAULT_PROFIT_MULTIPLE,
+    );
+    const maxSellFraction = resolvePerModel(
+      provider.maxSellFraction,
+      pin.model_name,
+      DEFAULT_MAX_SELL_FRACTION,
+    );
+    const officialOut = officialOutByKey.get(
+      `${pin.channel_id}|${pin.model_name}`,
+    );
+    if (
+      officialOut !== undefined &&
+      officialOut > 0 &&
+      pin.current_output_price_micros * profitMultiple >
+        officialOut * maxSellFraction
+    )
+      continue;
+    throwIfRunAborted();
+    try {
+      await fetchJson(`${base}/api/marketplace/unpin`, {
+        method: "POST",
+        headers: {
+          ...marketplaceHeaders(provider),
+          "Content-Type": "application/json",
+        },
+        body: {
+          token_id: pin.token_id,
+          channel_id: pin.channel_id,
+          model_name: pin.model_name,
+        },
+        timeoutMs: 30_000,
+      });
+      await postPin(provider, pin.token_id, pin.channel_id, pin.model_name);
+      consola.info(
+        `[${provider.name}] re-pinned ${pin.model_name} -> ${pin.channel_id} at dropped price ($${(pin.confirmed_output_price_micros / 1e6).toFixed(3)} -> $${(pin.current_output_price_micros / 1e6).toFixed(3)}/M out)`,
+      );
+      result.accepted++;
+    } catch (err) {
+      consola.warn(
+        `[${provider.name}] drop re-pin failed for ${pin.model_name} -> ${pin.channel_id}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return result;
+}
+
+export async function ensurePins(
+  provider: A7ProviderConfig,
+  lanes: MerchantLane[],
+  tokens: Map<string, LaneToken>,
+  dryRun: boolean,
+): Promise<{
+  created: number;
+  repinned: number;
+  pinned: Set<string>;
+  throttled: number;
+}> {
+  const result = {
+    created: 0,
+    repinned: 0,
+    pinned: new Set<string>(),
+    throttled: 0,
+  };
+  const existing = new Map<string, number>();
+  if (!dryRun) {
+    for (const pin of await listPins(provider))
+      existing.set(`${pin.token_id}|${pin.model_name}`, pin.channel_id);
+  }
+
+  for (const lane of lanes) {
+    throwIfRunAborted();
+    const name = laneTokenName(lane);
+    const token = tokens.get(name);
+    if (!token) continue;
+    if (dryRun) {
+      result.created++;
+      result.pinned.add(name);
+      continue;
+    }
+    // Always re-POST, even for an unchanged merchant: the POST re-confirms the
+    // price snapshot (accepting any pending merchant reprice) and refreshes the
+    // routing flags; skipping left raised prices unaccepted indefinitely.
+    // Retried once: a pin POSTed within a second of the token's creation can
+    // fail while a7 settles, which left brand-new lanes live but UNPINNED (the
+    // probe then validated smart routing, not the merchant).
+    const current = existing.get(`${token.tokenId}|${lane.model}`);
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
+      if (!(await awaitTokenThrottle(provider.baseUrl))) {
+        lastErr ??= new Error("HTTP 429: wait budget spent");
+        break;
+      }
+      try {
+        await postPin(
+          provider,
+          token.tokenId,
+          lane.listing.channel_id,
+          lane.model,
+        );
+        if (current === undefined) result.created++;
+        else result.repinned++;
+        result.pinned.add(name);
+        lastErr = undefined;
+        break;
+      } catch (err) {
+        lastErr = err;
+        // Same account limit as the token routes: a 2 s retry into a 429 only
+        // earns two more, so the next attempt waits the cooldown out instead.
+        if (String(err instanceof Error ? err.message : err).includes("429"))
+          noteTokenThrottle(provider.baseUrl);
+      }
+    }
+    if (lastErr !== undefined) {
+      const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+      if (msg.includes("429")) result.throttled++;
+      consola.warn(
+        `[${provider.name}] pin failed for ${lane.model} -> ${lane.listing.channel_id}: ${msg}`,
+      );
+    }
+  }
+  return result;
+}

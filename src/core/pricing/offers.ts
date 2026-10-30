@@ -1,0 +1,129 @@
+// Input shape for the pricing pipeline. Each provider's discover function
+// returns UpstreamOffer[]; compute() consumes the union and produces a
+// PricedPlan. No mid-pipeline mutation.
+
+import type { GridPricingInfo, MergedGroup, ModelType } from "@core/types";
+import type { ModelTestDetail } from "@core/testing/types";
+import type { ProviderReport } from "@core/types";
+import type { ModelMetadata, ProviderConfig } from "@core/validations/config";
+import type { PricingSource } from "./sources/types";
+
+type ProviderKind = string;
+
+export interface OfferModel {
+  exposed: string;
+  upstream: string;
+  /** Publish under this name instead of `exposed`, keeping the exposed name for
+   *  pricing and the cap. Splits a provider's lanes off the shared model name so
+   *  auto cannot route to them (see `publishAs` in the provider config). */
+  publishAs?: string;
+  /** Undefined = no per-model pricing. Compute falls back to cheapest existing group ratio. */
+  upstreamRatio?: number;
+  upstreamCompletionRatio?: number;
+  cacheRatio?: number;
+  createCacheRatio?: number;
+  /** With quotaType ≥ 1: per-call price, ratio path skipped. */
+  modelPrice?: number;
+  /** 1=per-request, 3=flat custom, 4=grid. ≥1 bypasses ratio. */
+  quotaType?: number;
+  testDetail?: ModelTestDetail;
+  /** Channel-scoped param_override JSON (e.g. OpenRouter provider.only host pin). */
+  paramOverride?: string;
+  /** Intentional same-model failover channel; exempt from capAbove1x dedup drop. */
+  failoverDuplicate?: boolean;
+  /** Forces ratio=0 + group_ratio=0; cap check skipped. (OpenRouter free, NVIDIA) */
+  isFree?: boolean;
+  /** effort -> upstream ID, emitted as `<name>@effort:<effort>` mapping keys. */
+  effortVariants?: Record<string, string>;
+  /** Kept only via a 429 accept (capacity throttle, not a real pass). The
+   *  emitted channel is created disabled so new-api's auto-test enables it once
+   *  the limit clears, instead of serving guaranteed-429 requests. */
+  rateLimited?: boolean;
+  modelType: ModelType;
+  /** Original endpoint strings — gates task-override sub-split detection (e.g. presence of openai-video). */
+  endpoints?: string[];
+  /** Normalized via normalizeEndpointTypes; feeds inferModelType + responses-api detection. */
+  normalizedEndpoints?: string[];
+  audioRatio?: number;
+  audioCompletionRatio?: number;
+  imageRatio?: number;
+  /** Per-resolution grid rows (ephone image models priced by resolution). */
+  gridRows?: GridPricingInfo;
+  /** "tiered_expr" when billingExpr is set; otherwise "ratio" or undefined. */
+  billingMode?: string;
+  /** expr-lang expression; presence forces tiered_expr billing, ratios are ignored. */
+  billingExpr?: string;
+  /** Per-model upstream hash; used only for snapshot/drift, never written to target. */
+  pricingVersion?: string;
+  /** Provider-supplied metadata (e.g. upstream max_completion_tokens). Merged into the model's metadata column; config enabledModels overrides win. */
+  metadata?: ModelMetadata;
+}
+
+/** Shared per-run context handed to every provider processor. */
+export interface ProviderRunContext {
+  pricingSources: PricingSource[];
+  reverseMapping: Map<string, string>;
+  /** Skip all upstream probes/tests/token-creation; synthesize pass-through
+   *  offers from discovered pricing so the run costs nothing and writes nothing.
+   *  Used by `sync run --dry-run` to preview pricing + diff. */
+  dryRun?: boolean;
+  /** Target channels as of this run, for providers that reprice lanes they did not re-select. */
+  liveChannels?: {
+    name?: string;
+    tag?: string;
+    group?: string;
+    models: string;
+    status?: number;
+    other_info?: string;
+  }[];
+}
+
+export interface UpstreamOffer {
+  provider: string;
+  providerKind: ProviderKind;
+  /** Upstream group name. */
+  group: string;
+  /** Tier channel-name base; already sanitized + collision-disambiguated. */
+  sanitizedBase: string;
+  vendor: string;
+  channelType: number;
+  baseUrl: string;
+  apiKey: string;
+  /** Per-published-model credential, when the provider mints one key per model
+   *  instead of sharing one across every channel it emits. Falls back to apiKey. */
+  apiKeyByModel?: Map<string, string>;
+  /** 1.0 = no group concept. 0 = free (NVIDIA, OpenRouter free). */
+  groupRatio: number;
+  channelRemark: string;
+  models: OfferModel[];
+  priceAdjustment?: ProviderConfig["priceAdjustment"];
+  defaultAdjustment: number;
+  /** OpenRouter paid: cap-fitting binary search picks one group_ratio for the whole offer. */
+  paidTier?: boolean;
+  /** Free-tier offer (all models $0). Routes to pricing phase A; replaces the per-providerKind whitelist. */
+  isFreeTier?: boolean;
+  /**
+   * The upstream was unreachable at probe time and these models were never
+   * tested. Channels are created DISABLED so new-api's scheduled test owns
+   * bringing them back rather than a later sync happening to catch them healthy.
+   */
+  upstreamDown?: boolean;
+}
+
+/** newapi only; empty for nvidia/openrouter. */
+export interface EndpointPathInfo {
+  path: string;
+  method: string;
+}
+
+interface ProviderEndpointMetadata {
+  endpointPaths: Map<string, EndpointPathInfo>;
+}
+
+export interface ProviderResult {
+  report: ProviderReport;
+  offers: UpstreamOffer[];
+  endpointMetadata: ProviderEndpointMetadata;
+  /** Group ratios for live lanes this run did not re-select but still owns. */
+  extraGroups?: MergedGroup[];
+}

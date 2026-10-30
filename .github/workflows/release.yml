@@ -1,0 +1,129 @@
+name: Release
+
+# Source of truth for the release version is `package.json`'s `version` field.
+# On every push to main we:
+#   1. Read the version
+#   2. Run `bun run build` which typechecks, bundles the frontend, inlines it
+#      as base64 into the embedded-assets manifest, builds the portable JS
+#      bundle, and cross-compiles 6 native binaries (linux x64/arm64,
+#      darwin x64/arm64, windows x64/arm64)
+#   3. Rename artifacts with the version prefix
+#   4. Delete any existing release + tag at v<version>
+#   5. Create a fresh release and upload the artifacts
+#
+# Every artifact — js bundle and all 6 native binaries — is a single file
+# with the frontend baked in. Nothing to extract, no public/ dir required.
+#
+# To cut a new release: bump "version" in package.json, merge to main.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Read version from package.json
+        id: pkg
+        run: |
+          VERSION=$(bun -e 'console.log(require("./package.json").version)')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "Releasing v$VERSION"
+
+      - run: bun install --frozen-lockfile
+
+      # Builds: typecheck → frontend (tailwind) → asset manifest (base64
+      # inlined) → js bundle → 6 native binaries. See src/build.ts.
+      - name: Build all artifacts
+        run: bun run build
+
+      # --- Rename artifacts with version prefix ------------------------------
+      - name: Stage release artifacts
+        id: stage
+        run: |
+          VERSION=${{ steps.pkg.outputs.version }}
+          PREFIX="new-api-sync-v${VERSION}"
+          OUT="release"
+          mkdir -p "$OUT"
+
+          # Native binaries — single file each, frontend baked in via base64
+          # through Bun's `--compile`. macOS/Linux users `chmod +x` then run.
+          cp dist/new-api-sync-linux-x64         "$OUT/${PREFIX}-linux-x64"
+          cp dist/new-api-sync-linux-arm64       "$OUT/${PREFIX}-linux-arm64"
+          cp dist/new-api-sync-darwin-x64        "$OUT/${PREFIX}-darwin-x64"
+          cp dist/new-api-sync-darwin-arm64      "$OUT/${PREFIX}-darwin-arm64"
+          cp dist/new-api-sync-windows-x64.exe   "$OUT/${PREFIX}-windows-x64.exe"
+          cp dist/new-api-sync-windows-arm64.exe "$OUT/${PREFIX}-windows-arm64.exe"
+
+          # JS bundle — single portable file, frontend inlined the same way.
+          # Runs on any platform with Bun installed.
+          cp dist/new-api-sync.js "$OUT/${PREFIX}.js"
+
+          ls -lh "$OUT/"
+          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
+
+      # --- Release ------------------------------------------------------------
+      - name: Delete existing release and tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ steps.pkg.outputs.tag }}" \
+            --yes --cleanup-tag 2>/dev/null || true
+
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          name: ${{ steps.pkg.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## Downloads
+
+            Every artifact is a single self-contained file with the full sync engine and web UI baked in, ready to discover, test, price, and push AI models from external providers into your new-api target instance. Pick the native binary for your platform, or the js bundle if you already have [Bun](https://bun.sh).
+
+            | Platform | File |
+            |---|---|
+            | Linux x64 | `${{ steps.stage.outputs.prefix }}-linux-x64` |
+            | Linux arm64 | `${{ steps.stage.outputs.prefix }}-linux-arm64` |
+            | macOS Apple Silicon | `${{ steps.stage.outputs.prefix }}-darwin-arm64` |
+            | macOS Intel | `${{ steps.stage.outputs.prefix }}-darwin-x64` |
+            | Windows x64 | `${{ steps.stage.outputs.prefix }}-windows-x64.exe` |
+            | Windows arm64 | `${{ steps.stage.outputs.prefix }}-windows-arm64.exe` |
+            | JS bundle (requires Bun) | `${{ steps.stage.outputs.prefix }}.js` |
+
+            ### Run a native binary (no runtime required)
+
+            ```sh
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.pkg.outputs.tag }}/${{ steps.stage.outputs.prefix }}-linux-x64
+            chmod +x ${{ steps.stage.outputs.prefix }}-linux-x64
+            ./${{ steps.stage.outputs.prefix }}-linux-x64 ui --port 3000
+            ```
+
+            ### Run the JS bundle (any platform, just needs [Bun](https://bun.sh))
+
+            ```sh
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.pkg.outputs.tag }}/${{ steps.stage.outputs.prefix }}.js
+            bun ${{ steps.stage.outputs.prefix }}.js ui --port 3000
+            ```
+          files: |
+            release/${{ steps.stage.outputs.prefix }}-linux-x64
+            release/${{ steps.stage.outputs.prefix }}-linux-arm64
+            release/${{ steps.stage.outputs.prefix }}-darwin-x64
+            release/${{ steps.stage.outputs.prefix }}-darwin-arm64
+            release/${{ steps.stage.outputs.prefix }}-windows-x64.exe
+            release/${{ steps.stage.outputs.prefix }}-windows-arm64.exe
+            release/${{ steps.stage.outputs.prefix }}.js

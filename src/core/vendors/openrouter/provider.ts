@@ -1,0 +1,685 @@
+import {
+  buildChannelModelMapping,
+  resolveBareNames,
+  toBareName,
+} from "@core/catalog/bare-name";
+import { CHANNEL_TYPES } from "@core/catalog/constants/channel-types";
+import {
+  matchesAnyPattern,
+  matchesBlacklist,
+  sanitizeGroupName,
+} from "@core/catalog/constants/patterns";
+import { inferVendorFromModelName } from "@core/catalog/constants/vendor-matchers";
+import {
+  getEnabledModelGlobs,
+  getMetadataFromEnabledModels,
+  type RuntimeConfig,
+} from "@core/config";
+import type {
+  OfferModel,
+  ProviderResult,
+  ProviderRunContext,
+  UpstreamOffer,
+} from "@core/pricing/offers";
+import { resolvePerModel, resolvePriceAdjustment } from "@core/pricing";
+import { tryFetchJson } from "@core/infra/http";
+import { VerdictStore } from "@core/infra/verdict-store";
+import { testAndFilterModels } from "@core/testing/runner";
+import type { ModelTestDetail } from "@core/testing/types";
+import type { ProviderReport } from "@core/types";
+import type { OpenRouterProviderConfig } from "@core/validations/config";
+import { t } from "@server/i18n";
+import { consola } from "consola";
+import { buildCapabilityMap, lowercaseExposed } from "../shared/capability-map";
+import { withCostTracking } from "../shared/cost-tracker";
+import { partitionByVendor } from "../shared/partition";
+import { discoverOpenRouterFreeModels } from "./discovery";
+import { ensureProvisionedKeys } from "./keys";
+
+// new-api's per-token base: model_ratio 1 == $2/M tokens.
+const USD_PER_M_PER_RATIO = 2;
+// Cost + 50% when a provider's priceAdjustment default is unset.
+const DEFAULT_PAID_MARKUP = 1.5;
+// fp8 is the floor. Anything coarser trades output quality for a price we are not
+// short of alternatives at, and "unknown" covers the full-precision hosts, so only
+// the explicitly-lower tiers are named here.
+const SUB_FP8_QUANTIZATIONS = new Set(["fp4", "int4", "nf4", "fp6", "int8"]);
+// Hosts with confirmed-degraded output. akashml passes probes but its glm-5.2 fp8
+// garbles names and loses context (user-reported, reproducible against novita's
+// fp8 of the same weights), so its cheap price never wins the host pick.
+//
+// deepinfra is NOT excluded despite the direct di1 lane: di1 only carries four
+// models, so blanket-blocking the host also cost every model it does not serve.
+// The two lanes coexist and the cheaper one wins per model; paying OR's cut is
+// better than having no host at all.
+const EXCLUDED_HOSTS = new Set(["akashml"]);
+
+// Sampler/format knobs a chat client sends unprompted. A host pinned via provider.only
+// gets the request verbatim, so one it does not accept fails the whole call: GMICloud
+// omits frequency_penalty/presence_penalty/stop from its supported list and answers
+// `400001 Invalid request parameters` when a preset sends them, while DeepSeek's own
+// endpoint of the SAME model takes all three. Only params in this list are ever
+// stripped, so a sparse or stale upstream list cannot delete something load-bearing.
+const CLIENT_SENT_PARAMS = [
+  "frequency_penalty",
+  "presence_penalty",
+  "repetition_penalty",
+  "top_k",
+  "min_p",
+  "top_a",
+  "stop",
+  "seed",
+  "logit_bias",
+  "response_format",
+] as const;
+
+type OverrideOp = {
+  mode: string;
+  path?: string;
+  value?: unknown;
+  keep_origin?: boolean;
+  conditions?: {
+    path: string;
+    mode: string;
+    value: unknown;
+    invert?: boolean;
+  }[];
+  logic?: string;
+};
+
+function unsupportedParamOps(
+  supported: string[] | undefined,
+  acceptsImages: boolean,
+  disableThinking?: boolean,
+): { operations: OverrideOp[] } | undefined {
+  const ops: OverrideOp[] = [];
+  if (supported && supported.length > 0) {
+    const ok = new Set(supported);
+    for (const path of CLIENT_SENT_PARAMS) {
+      if (!ok.has(path)) ops.push({ path, mode: "delete" });
+    }
+  }
+  // A text-only model rejects the entire request over one image, and the sender
+  // usually cannot tell an image was in it: iOS puts stickers and Memoji in as
+  // PNG attachments. Dropping the image costs that attachment; keeping it costs
+  // the reply.
+  if (!acceptsImages) ops.push({ mode: "strip_images" });
+  // Hybrid models (glm-4.7) reason by default on OpenRouter and clients that
+  // never asked for reasoning get it folded into the visible reply (Chub
+  // renders think tags raw). exclude keeps the chain of thought (the model
+  // still reasons, verified: same completion_tokens) but OpenRouter drops it
+  // from the stream, so every client sees only the answer. Two escapes: an
+  // explicit client reasoning object passes (keep_origin), and a -thinking
+  // alias on the same channel skips the op entirely (original_model is the
+  // client-requested name, checked before mapping), so visible reasoning
+  // stays one model-picker choice away.
+  if (disableThinking)
+    ops.push({
+      path: "reasoning",
+      mode: "set",
+      value: { exclude: true },
+      keep_origin: true,
+      conditions: [
+        {
+          path: "original_model",
+          mode: "suffix",
+          value: "-thinking",
+          invert: true,
+        },
+      ],
+      logic: "AND",
+    });
+  return ops.length > 0 ? { operations: ops } : undefined;
+}
+// A price cap of 0 makes OpenRouter refuse instead of bill when a free endpoint is
+// gone; ling-3.1-flash:free billed ~$10 a day on Novita after its promotion ended.
+const FREE_ONLY_PROVIDER = { max_price: { prompt: 0, completion: 0 } };
+
+// Host exclusions that apply to ONE model rather than the whole host. gmicloud's
+// glm-5.2 does not separate reasoning from content and runs a classifier that trims
+// replies mid-response (user-reported), and it is the priciest open1 glm-5.2 lane;
+// its minimax-m3 is the cheapest lane we have and stays.
+const EXCLUDED_HOSTS_BY_MODEL: Record<string, Set<string>> = {
+  // digitalocean is the only glm-5.2 host OpenRouter reports as quantization
+  // "unknown" rather than fp8, and it collapses on long context: 10.4 tps on a
+  // 32k prompt where every other lane ran 55-127. Its kimi-k2.6 and mimo lanes
+  // hold 44-51 tps and stay.
+  "glm-5.2": new Set(["gmicloud", "digitalocean"]),
+};
+
+// A host's published quantization, appended to its tag when OpenRouter has not
+// already put it there. OpenRouter suffixes the tag for SOME hosts (novita/fp8)
+// and not others (together, digitalocean), so without this the published name
+// says nothing about precision for exactly the hosts a caller most wants to
+// check. "unknown" is skipped: it is OpenRouter's "not declared", and spelling
+// it into a channel name reads as a precision rather than the absence of one.
+function quantTag(tag: string, quantization?: string): string {
+  const q = (quantization ?? "").trim().toLowerCase();
+  if (!q || !tag || q === "unknown") return tag;
+  return tag.includes(q) ? tag : `${tag}/${q}`;
+}
+
+// PAID models are never probed (a probe is a billed request per model per run),
+// so a paid host has no test detail at all unless one is synthesised here.
+// OpenRouter publishes supported_parameters PER HOST, and "reasoning" appears on
+// exactly the reasoning models (glm-4.7 8/8 hosts, kimi-k3 15/15, llama-3.3
+// 0/13), so the host's own declaration stands in for a probe.
+//
+// It no longer carries thinkingDetected: that only ever fed thinking_to_content,
+// which is obsolete now that new-api judges stream emptiness on content rather
+// than on the billing buffer.
+function advertisedThinkingDetail(
+  upstream: string,
+  supportedParameters?: string[],
+): ModelTestDetail | undefined {
+  const params = supportedParameters ?? [];
+  if (!params.includes("reasoning") && !params.includes("include_reasoning"))
+    return undefined;
+  return {
+    model: upstream,
+    success: true,
+    streamSuccess: null,
+    toolCallSuccess: null,
+    toolParallel: null,
+    authenticityProbed: false,
+    channelType: CHANNEL_TYPES.OPENROUTER,
+  };
+}
+
+async function fetchOpenRouterBalance(
+  baseUrl: string,
+  apiKey: string,
+): Promise<number | null> {
+  const data = await tryFetchJson<{
+    data?: { total_credits?: number; total_usage?: number };
+  }>(`${baseUrl.replace(/\/$/, "")}/v1/credits`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  const c = data?.data?.total_credits,
+    u = data?.data?.total_usage;
+  return c === undefined || u === undefined ? null : c - u;
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[mid]!
+    : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+export async function processOpenRouterProvider(
+  providerConfig: OpenRouterProviderConfig,
+  config: RuntimeConfig,
+  ctx: ProviderRunContext,
+): Promise<ProviderResult> {
+  const name = providerConfig.name;
+  const report: ProviderReport = {
+    name,
+    success: false,
+    groups: 0,
+    models: 0,
+    tokens: { created: 0, existing: 0, deleted: 0 },
+  };
+  const offers: UpstreamOffer[] = [];
+  const endpointMetadata = { endpointPaths: new Map() };
+
+  await withCostTracking(
+    name,
+    () =>
+      ctx.dryRun
+        ? Promise.resolve(null)
+        : fetchOpenRouterBalance(
+            providerConfig.baseUrl,
+            // /v1/credits refuses inference keys; see balance.ts.
+            providerConfig.managementKey ?? providerConfig.apiKey ?? "",
+          ),
+    async () => {
+      try {
+        if (!providerConfig.managementKey && !providerConfig.apiKey) {
+          report.error = `openrouter: ${name} needs a managementKey or an apiKey`;
+          return;
+        }
+        // Catalog and endpoint routes are public; the management key is only
+        // sent so a rate limit counts against the account, not the anonymous pool.
+        const readKey =
+          providerConfig.managementKey ?? providerConfig.apiKey ?? "";
+        const enabledGlobs =
+          getEnabledModelGlobs(providerConfig.enabledModels) ?? [];
+        // Exact (non-glob) enabled ids = explicitly-requested paid models. Fetch
+        // their per-host endpoint pricing during discovery.
+        const requestedPaidIds = enabledGlobs.filter(
+          (id) => !id.includes("*") && !id.includes("?"),
+        );
+
+        const catalogue = await discoverOpenRouterFreeModels(
+          providerConfig.baseUrl,
+          readKey,
+          requestedPaidIds,
+        );
+        consola.info(
+          t("CORE.OPENROUTER.DISCOVERED_FREE", {
+            name,
+            count: catalogue.freeIds.length,
+          }),
+        );
+
+        const freeSet = new Set(catalogue.freeIds);
+        // A requested id with a paid host stays paid even when another provider
+        // serves it free: that provider gets a separate :free lane pinned to it.
+        const paidSet = new Set(
+          requestedPaidIds.filter(
+            (id) => !freeSet.has(id) || catalogue.paidEndpoints.has(id),
+          ),
+        );
+
+        const candidateIds = [...new Set([...freeSet, ...paidSet])];
+        if (candidateIds.length === 0) {
+          report.error = t("CORE.ERROR.NO_MODELS_FOUND");
+          return;
+        }
+
+        const filtered = candidateIds.filter((id) => {
+          const bare = toBareName(id);
+          if (
+            matchesBlacklist(bare, config.blacklist, name) ||
+            matchesBlacklist(id, config.blacklist, name)
+          )
+            return false;
+          if (
+            config.modelFilter?.length &&
+            !matchesAnyPattern(id, config.modelFilter) &&
+            !matchesAnyPattern(bare, config.modelFilter)
+          )
+            return false;
+          return true;
+        });
+
+        if (filtered.length === 0) {
+          report.error = t("CORE.ERROR.ALL_MODELS_FILTERED_SHORT");
+          return;
+        }
+
+        // Only the free tier is probed. A paid probe is a billed request per model per
+        // run, and OpenRouter already removes a model from its own catalog when the
+        // upstream drops it; the free tier has no such guarantee and throttles constantly,
+        // so it still earns the test. Paid models pass through untested.
+        const toProbe = filtered.filter((id) => freeSet.has(id));
+        const untested = filtered.filter((id) => paidSet.has(id));
+
+        // One capped key per model, minted through the management key before
+        // anything is sent: the probe runs on the same credential the channel
+        // will carry, so a bootstrap inference key is never needed (open1's was
+        // revoked in the Aug 27 rotation and no new model could pass its probe
+        // for three weeks). A model that then fails keeps its key for the next
+        // run; it is guardrail-pinned, daily-capped and its secret is in the
+        // store, so nothing is orphaned. Skipped on a dry run: minting is a write.
+        const candidateExposed = new Map(
+          resolveBareNames(filtered, config.modelMapping).map(
+            (r) => [r.upstream, r.exposed] as const,
+          ),
+        );
+        let keyByModel = new Map<string, string>();
+        if (providerConfig.managementKey && !ctx.dryRun) {
+          const keyStore = config.verdictStore
+            ? new VerdictStore(config.verdictStore)
+            : null;
+          if (providerConfig.requireKeyStore && !keyStore?.canHoldKeys)
+            throw new Error(
+              `openrouter: ${name} sets requireKeyStore but verdictStore.encryptionKey is missing`,
+            );
+          const existingKeyByName =
+            (await keyStore?.fetchProvisionedKeys(name)) ??
+            new Map<string, string>();
+          const provisioned = await ensureProvisionedKeys({
+            baseUrl: providerConfig.baseUrl,
+            managementKey: providerConfig.managementKey,
+            provider: name,
+            models: [...new Set(candidateExposed.values())],
+            existingKeyByName,
+            requireStore: providerConfig.requireKeyStore,
+            permaslugByModel: new Map(
+              [...candidateExposed].map(
+                ([upstream, exposed]) => [exposed, upstream] as const,
+              ),
+            ),
+            dailyLimitFor: (model) =>
+              resolvePerModel(providerConfig.keyDailyLimitUsd, model, 15),
+            expiryDays: providerConfig.keyExpiryDays ?? 90,
+          });
+          if (provisioned.minted > 0) {
+            if (keyStore?.canHoldKeys)
+              // Merged, never replaced: a run that sees only some models (a filter, a
+              // discovery gap) wiped every other secret on 2026-09-29.
+              await keyStore.putProvisionedKeys(
+                name,
+                new Map([...existingKeyByName, ...provisioned.keyByName]),
+              );
+            else
+              consola.warn(
+                `[${name}] ${provisioned.minted} key(s) minted with nowhere to store the secret; the next run will mint again`,
+              );
+          }
+          keyByModel = provisioned.keyByModel;
+        }
+        const probeKeyFor = (upstream: string): string | undefined =>
+          keyByModel.get(candidateExposed.get(upstream) ?? "");
+
+        let working = untested;
+        let freeWorking = new Set<string>();
+        let details: Awaited<
+          ReturnType<typeof testAndFilterModels>
+        >["details"] = [];
+        if (toProbe.length > 0) {
+          consola.info(
+            t("CORE.OPENROUTER.PROBING", { name, count: toProbe.length }),
+          );
+          const filterResult = await testAndFilterModels({
+            allModels: toProbe,
+            baseUrl: providerConfig.baseUrl,
+            apiKey: providerConfig.apiKey ?? "",
+            apiKeyFor: probeKeyFor,
+            channelType: CHANNEL_TYPES.OPENAI,
+            providerLabel: name,
+            testableModelTypes: new Set(["text"]),
+            acceptRateLimited: providerConfig.acceptRateLimited ?? false,
+            extraBody: { provider: FREE_ONLY_PROVIDER },
+            capabilities: buildCapabilityMap(
+              toProbe,
+              lowercaseExposed(config),
+              ctx,
+            ),
+          });
+          freeWorking = new Set(filterResult.workingModels);
+          working = [...new Set([...untested, ...filterResult.workingModels])];
+          details = filterResult.details ?? [];
+        }
+
+        consola.info(
+          t("CORE.OPENROUTER.WORKING", {
+            name,
+            working: working.length,
+            total: filtered.length,
+          }),
+        );
+        if (working.length === 0) {
+          report.error = t("CORE.ERROR.NO_WORKING_MODELS");
+          return;
+        }
+
+        const resolutions = resolveBareNames(working, config.modelMapping);
+        const reverseMapping = buildChannelModelMapping(resolutions);
+        // Lanes split off the shared model name: these publish as their own model so
+        // auto never promotes a token from a cheap provider's lane to one of these.
+        const publishAsFor = (exposed: string): string | undefined =>
+          Object.entries(providerConfig.publishAs ?? {}).find(([glob]) =>
+            matchesAnyPattern(exposed, [glob]),
+          )?.[1];
+        const freeResolutions = resolutions.filter((r) =>
+          freeWorking.has(r.upstream),
+        );
+        const paidResolutions = resolutions.filter((r) =>
+          paidSet.has(r.upstream),
+        );
+
+        const enabledMetadata = getMetadataFromEnabledModels(
+          providerConfig.enabledModels,
+        );
+        const thinkingDisabled = (r: { exposed: string; upstream: string }) =>
+          Object.entries(enabledMetadata).some(
+            ([glob, meta]) =>
+              meta.disableThinking === true &&
+              (matchesAnyPattern(r.exposed, [glob]) ||
+                matchesAnyPattern(r.upstream, [glob])),
+          );
+
+        let totalVendors = 0;
+        const emitFreeTier = () => {
+          if (freeResolutions.length === 0) return;
+          const byVendor = partitionByVendor(
+            freeResolutions,
+            (r) => r.exposed,
+            "other",
+          );
+          for (const [vendor, vendorResolutions] of byVendor) {
+            const offerModels: OfferModel[] = vendorResolutions.map((r) => ({
+              exposed: r.exposed,
+              upstream: reverseMapping[r.exposed] ?? r.upstream,
+              modelType: "text",
+              testDetail: details.find((d) => d.model === r.upstream),
+              isFree: true,
+              paramOverride: JSON.stringify({
+                provider: {
+                  ...FREE_ONLY_PROVIDER,
+                  only: catalogue.freeProviders.get(r.upstream) ?? [],
+                  allow_fallbacks: false,
+                },
+                ...(thinkingDisabled(r)
+                  ? unsupportedParamOps(undefined, true, true)
+                  : {}),
+              }),
+            }));
+            offers.push({
+              provider: name,
+              providerKind: "openrouter",
+              group: vendor,
+              sanitizedBase: sanitizeGroupName(name),
+              vendor,
+              channelType: CHANNEL_TYPES.OPENROUTER,
+              baseUrl: providerConfig.baseUrl,
+              apiKey: providerConfig.apiKey ?? "",
+              apiKeyByModel: keyByModel,
+              groupRatio: providerConfig.ratio,
+              channelRemark: `OpenRouter free via ${name}`,
+              models: offerModels,
+              priceAdjustment: providerConfig.priceAdjustment,
+              defaultAdjustment: 0,
+              isFreeTier: true,
+            });
+            totalVendors++;
+          }
+        };
+
+        // Paid: one channel per (model, upstream host). Each pins its host via
+        // provider.only + no-fallback, priced off that host's real cost * markup.
+        // Margin is baked into groupRatio (adj resolved to 0) so capAbove1x leaves
+        // it untouched (a positive reprice would collapse to +5% since the model's
+        // own price is its 1x list). Markup is resolved PER MODEL (against the
+        // exposed name) so config priceAdjustment can key individual models, e.g.
+        // a 50% (0.5) lane alongside a 55% default.
+        const emitPaidPerHost = () => {
+          for (const r of paidResolutions) {
+            const hosts = catalogue.paidEndpoints.get(r.upstream);
+            if (!hosts?.length) {
+              consola.warn(
+                t("CORE.OPENROUTER.PAID_NO_PRICING", {
+                  name,
+                  model: r.upstream,
+                }),
+              );
+              continue;
+            }
+            const markup =
+              1 +
+              resolvePriceAdjustment({
+                adj: providerConfig.priceAdjustment,
+                model: r.exposed,
+                vendor: inferVendorFromModelName(r.exposed) ?? "",
+                modelType: "text",
+                fallback: DEFAULT_PAID_MARKUP - 1,
+                modelMapping: config.modelMapping,
+              });
+            const vendor = inferVendorFromModelName(r.exposed) ?? "other";
+            // Per-model quantization allowance (glob-keyed): glm-4.7's own vendor
+            // z-ai only serves fp4 on OpenRouter, and losing it left two lanes.
+            const allowedQuant = new Set(
+              Object.entries(providerConfig.allowQuantizations ?? {})
+                .filter(([glob]) => matchesAnyPattern(r.exposed, [glob]))
+                .flatMap(([, qs]) => qs.map((q) => q.toLowerCase())),
+            );
+            const reliableHosts = hosts.filter(
+              (h) =>
+                (!SUB_FP8_QUANTIZATIONS.has(
+                  (h.quantization ?? "").toLowerCase(),
+                ) ||
+                  allowedQuant.has((h.quantization ?? "").toLowerCase())) &&
+                !EXCLUDED_HOSTS.has(h.provider.toLowerCase()) &&
+                !EXCLUDED_HOSTS_BY_MODEL[r.exposed]?.has(
+                  h.provider.toLowerCase(),
+                ),
+            );
+            // Warn rather than skip silently: a paid model that stops publishing
+            // keeps whatever ratio it last had, and desiredModelsWithoutRatio
+            // guards that value on every later run. laguna-s-2.1 sat at ratio 0
+            // for weeks this way after poolside moved its only host to fp4,
+            // reading as free in the catalog while a stale channel still served it.
+            if (reliableHosts.length === 0) {
+              consola.warn(
+                t("CORE.OPENROUTER.PAID_NO_RELIABLE_HOST", {
+                  name,
+                  model: r.exposed,
+                }),
+              );
+              continue;
+            }
+            // The N cheapest reliable hosts, each pinned via provider.only, instead of
+            // fanning out a channel per host. Extras are failoverDuplicate so they do not
+            // re-enter tier selection: the cheapest sets the published price and the rest
+            // only catch the overflow when it is down or rate-limited.
+            // Keyed by glob against the exposed name, matching priceAdjustment. Absent
+            // key = 1 host, so fanning out stays opt-in per model.
+            const hostsWanted = resolvePerModel(
+              providerConfig.hostsPerModel,
+              r.exposed,
+              1,
+            );
+            // OpenRouter can list the SAME provider+quantization several times
+            // for one model at different prices (BaseTen served glm-5.2 four
+            // times, at $4.40 and $6.60 out). The channel name is built from
+            // provider+quantization, so two such rows produce one name and the
+            // emit step aborts the whole run on the collision. Keep the cheapest
+            // row per tag: the dearer duplicate has nothing else to offer.
+            // new-api prices output and cache per MODEL, so a lane differs only by
+            // its input price. relace sold glm-5.3 at $0.06 in but $12 out, and the
+            // lane billed output at a thirtieth of cost while ranking as the
+            // cheapest host. Price and rank each host by an effective input that
+            // covers the dearest of input, output and cache at the model's typical
+            // ratios (the median across its hosts, so one outlier cannot set it).
+            const typicalOut = median(
+              reliableHosts
+                .filter((h) => h.prompt > 0)
+                .map((h) => h.completion / h.prompt),
+            );
+            const typicalCache = median(
+              reliableHosts
+                .filter((h) => h.prompt > 0 && h.cacheRead != null)
+                .map((h) => (h.cacheRead ?? 0) / h.prompt),
+            );
+            const effectivePrompt = (h: (typeof reliableHosts)[number]) =>
+              Math.max(
+                h.prompt,
+                typicalOut > 0 ? h.completion / typicalOut : 0,
+                typicalCache > 0 && h.cacheRead != null
+                  ? h.cacheRead / typicalCache
+                  : 0,
+              );
+            const cheapestByTag = new Map<
+              string,
+              (typeof reliableHosts)[number]
+            >();
+            for (const host of [...reliableHosts].sort(
+              (a, b) => effectivePrompt(a) - effectivePrompt(b),
+            )) {
+              const tag = quantTag(host.tag, host.quantization);
+              if (!cheapestByTag.has(tag)) cheapestByTag.set(tag, host);
+            }
+            const cheapestHosts = [...cheapestByTag.values()].slice(
+              0,
+              hostsWanted,
+            );
+            const disableThinking = thinkingDisabled(r);
+            cheapestHosts.forEach((host, hostIndex) => {
+              // OpenRouter only suffixes the tag with the quantization for SOME
+              // hosts (novita/fp8), so the rest published a name that said
+              // nothing about precision and a caller could not tell an fp8 lane
+              // from an unknown one. The tag is the name users pick from, so
+              // name the quantization there rather than leaving it implied.
+              const hostTag = quantTag(host.tag, host.quantization);
+              const m: OfferModel = {
+                exposed: r.exposed,
+                upstream: reverseMapping[r.exposed] ?? r.upstream,
+                publishAs: publishAsFor(r.exposed),
+                modelType: "text",
+                testDetail:
+                  details.find((d) => d.model === r.upstream) ??
+                  (disableThinking
+                    ? undefined
+                    : advertisedThinkingDetail(
+                        r.upstream,
+                        host.supportedParameters,
+                      )),
+                upstreamRatio:
+                  (effectivePrompt(host) * 1_000_000) / USD_PER_M_PER_RATIO,
+                upstreamCompletionRatio:
+                  effectivePrompt(host) > 0
+                    ? host.completion / effectivePrompt(host)
+                    : 1,
+                cacheRatio:
+                  host.cacheRead != null && effectivePrompt(host) > 0
+                    ? host.cacheRead / effectivePrompt(host)
+                    : undefined,
+                paramOverride: JSON.stringify({
+                  provider: { only: [host.provider], allow_fallbacks: false },
+                  ...unsupportedParamOps(
+                    host.supportedParameters,
+                    !catalogue.textOnlyIds.has(r.upstream),
+                    disableThinking,
+                  ),
+                }),
+                ...(hostIndex > 0 ? { failoverDuplicate: true } : {}),
+              };
+              offers.push({
+                provider: name,
+                providerKind: "openrouter",
+                group: `${vendor}-${hostTag}`,
+                sanitizedBase: sanitizeGroupName(`${name}-${hostTag}`),
+                vendor,
+                channelType: CHANNEL_TYPES.OPENROUTER,
+                baseUrl: providerConfig.baseUrl,
+                apiKey: providerConfig.apiKey ?? "",
+                apiKeyByModel: keyByModel,
+                groupRatio: markup,
+                channelRemark: `OpenRouter ${host.provider} via ${name}`,
+                models: [m],
+                priceAdjustment: { default: 0 },
+                defaultAdjustment: 0,
+              });
+              totalVendors++;
+            });
+          }
+        };
+
+        emitFreeTier();
+        emitPaidPerHost();
+
+        consola.info(
+          t("CORE.OPENROUTER.SUMMARY", {
+            name,
+            total: resolutions.length,
+            free: freeResolutions.length,
+            paid: paidResolutions.length,
+            vendors: totalVendors,
+          }),
+        );
+
+        report.groups = totalVendors;
+        report.models = resolutions.length;
+        report.success = true;
+      } catch (error) {
+        report.error = error instanceof Error ? error.message : String(error);
+      }
+    },
+  );
+  return { report, offers, endpointMetadata };
+}

@@ -1,0 +1,642 @@
+import {
+  CHANNEL_TYPES,
+  getTaskModelOverride,
+  inferChannelType,
+} from "@core/catalog/constants/channel-types";
+import { tryFetchJson } from "@core/infra/http";
+import type { GridPricingInfo, GroupInfo } from "@core/types";
+import { t } from "@server/i18n";
+import { consola } from "consola";
+import type { ClientContext } from "./context";
+import type {
+  ChatfireModel,
+  EphoneModel,
+  ModelInfo,
+  PricingResponse,
+  PricingResponseV2,
+  PricingResponseV3,
+  UpstreamPricing,
+} from "./types";
+
+export async function fetchPricing(
+  ctx: ClientContext,
+): Promise<UpstreamPricing> {
+  const urls = [`${ctx.baseUrl}/api/pricing_new`, `${ctx.baseUrl}/api/pricing`];
+  let raw: { success: boolean; [key: string]: unknown } | undefined;
+  for (const url of urls) {
+    // Most relays expose /api/pricing publicly, but some (e.g. zetatechs) require
+    // the system token, so pass the client's auth headers either way.
+    const body = await tryFetchJson<{
+      success: boolean;
+      [key: string]: unknown;
+    }>(url, { headers: ctx.headers });
+    if (!body?.success || !body.data) continue;
+    if (url.endsWith("/pricing_new") && !Array.isArray(body.data)) continue;
+    raw = body;
+    break;
+  }
+  if (!raw) throw new Error(t("ERROR.NEWAPI_FETCH_PRICING_FAILED"));
+
+  const supportedEndpoint = (raw.supported_endpoint ?? {}) as Record<
+    string,
+    { path: string; method: string }
+  >;
+  let result: UpstreamPricing;
+  if (Array.isArray(raw.data)) {
+    result = parsePricingV1(ctx, raw as unknown as PricingResponse);
+  } else {
+    const data = raw.data as { model_info?: unknown };
+    if (Array.isArray(data.model_info)) {
+      result = parsePricingV3(ctx, raw as unknown as PricingResponseV3);
+    } else {
+      result = parsePricingV2(ctx, raw as unknown as PricingResponseV2);
+      result.endpointPaths = supportedEndpoint;
+    }
+  }
+  await applyConditionalPricing(ctx, result);
+  return result;
+}
+
+// Some relays (gptnb) bill per context-length tier but publish only the CHEAPEST
+// tier's ratio on /api/pricing, with no billing_expr to reveal the rest. The
+// tiers live on /api/pricing_legacy instead, so fetch them and raise the ratio to
+// the dearest tier: one published price has to cover every request, and a
+// long-context call billed at the short-context rate loses the difference.
+async function applyConditionalPricing(
+  ctx: ClientContext,
+  pricing: UpstreamPricing,
+): Promise<void> {
+  const body = await tryFetchJson<{
+    success?: boolean;
+    data?: {
+      ConditionalPricingEnabled?: boolean;
+      ModelConditionalPricing?: Record<
+        string,
+        {
+          Conditions?: Array<{ InputRatio?: number; CompletionRatio?: number }>;
+        }
+      >;
+    };
+  }>(`${ctx.baseUrl}/api/pricing_legacy`, { headers: ctx.headers });
+  const data = body?.data;
+  if (!data?.ConditionalPricingEnabled) return;
+  const conditional = data.ModelConditionalPricing;
+  if (!conditional) return;
+
+  let raised = 0;
+  for (const [name, entry] of Object.entries(conditional)) {
+    const tiers = entry?.Conditions;
+    if (!tiers?.length) continue;
+    const inputs = tiers
+      .map((c) => c.InputRatio)
+      .filter((r): r is number => typeof r === "number" && r > 0);
+    if (!inputs.length) continue;
+    const dearest = Math.max(...inputs);
+    const current = pricing.modelRatios[name];
+    if (current === undefined || dearest <= current) continue;
+    // Pair the completion ratio with the tier we priced from; the dearest input
+    // tier often carries a LOWER completion ratio, and mixing the two overstates
+    // output cost.
+    const chosen = tiers.find((c) => c.InputRatio === dearest);
+    pricing.modelRatios[name] = dearest;
+    if (typeof chosen?.CompletionRatio === "number")
+      pricing.completionRatios[name] = chosen.CompletionRatio;
+    const model = pricing.models.find((m) => m.name === name);
+    if (model) {
+      model.ratio = dearest;
+      if (typeof chosen?.CompletionRatio === "number")
+        model.completionRatio = chosen.CompletionRatio;
+    }
+    raised++;
+  }
+  if (raised > 0)
+    consola.info(
+      t("CORE.NEWAPI.CONDITIONAL_PRICING", { name: ctx.name, count: raised }),
+    );
+}
+
+// The per-group `price` IS the model_ratio (upstream renders 提示/1M as
+// price * 2 * group_ratio). Take the bare price, never price * group_ratio: the
+// group ratio is applied separately downstream, so folding it in here would
+// square it. Cheapest group, to match how the flat model_ratio is read.
+function groupPriceRatio(
+  groupPrice:
+    | Record<string, { price?: number; group_ratio?: number }>
+    | undefined,
+): number | undefined {
+  if (!groupPrice) return undefined;
+  const prices = Object.values(groupPrice)
+    .map((g) => g?.price)
+    .filter((p): p is number => typeof p === "number" && p > 0);
+  return prices.length ? Math.min(...prices) : undefined;
+}
+
+// new-api answers this model_ratio (with completion_ratio 1) for any model it
+// holds no price for, so a relay publishing that pair is saying "unpriced",
+// not $75/M.
+export const NEW_API_UNPRICED_RATIO = 37.5;
+
+function publishedRatio(
+  modelRatio: number | undefined,
+  completionRatio: number | undefined,
+  groupPrice: Parameters<typeof groupPriceRatio>[0],
+): number | undefined {
+  if (modelRatio === NEW_API_UNPRICED_RATIO && (completionRatio ?? 1) === 1)
+    return groupPriceRatio(groupPrice);
+  return modelRatio ?? groupPriceRatio(groupPrice);
+}
+
+function parsePricingV1(
+  ctx: ClientContext,
+  data: PricingResponse,
+): UpstreamPricing {
+  const groupModels = new Map<string, Set<string>>();
+  const groupEndpoints = new Map<string, Set<string>>();
+  for (const model of data.data) {
+    const endpoints = model.supported_endpoint_types ?? model.endpoints ?? [];
+    for (const group of model.enable_groups ?? []) {
+      if (!groupModels.has(group)) {
+        groupModels.set(group, new Set());
+        groupEndpoints.set(group, new Set());
+      }
+      groupModels.get(group)!.add(model.model_name);
+      for (const endpoint of endpoints)
+        groupEndpoints.get(group)!.add(endpoint);
+    }
+  }
+
+  const groups: GroupInfo[] = Object.entries(
+    data.usable_group ?? data.group_names ?? {},
+  )
+    .filter(([name]) => name !== "")
+    // usable_group is name -> description on most relays, but some (holdai)
+    // return name -> ratio, and a number reaching the blacklist matcher throws.
+    .map(([name, description]) => ({
+      name,
+      description: typeof description === "string" ? description : name,
+      ratio: data.group_ratio[name] ?? 1,
+      models: Array.from(groupModels.get(name) ?? []),
+      channelType: inferChannelType(Array.from(groupEndpoints.get(name) ?? [])),
+    }));
+
+  const models: ModelInfo[] = data.data.map((m) => ({
+    name: m.model_name,
+    ratio: publishedRatio(m.model_ratio, m.completion_ratio, m.group_price),
+    completionRatio: m.completion_ratio,
+    cacheRatio:
+      m.cache_ratio !== undefined && m.cache_ratio >= 0
+        ? m.cache_ratio
+        : undefined,
+    createCacheRatio:
+      m.create_cache_ratio !== undefined && m.create_cache_ratio >= 0
+        ? m.create_cache_ratio
+        : undefined,
+    groups: m.enable_groups ?? [],
+    vendorId: m.vendor_id,
+    supportedEndpoints: m.supported_endpoint_types ?? m.endpoints ?? [],
+    modelPrice:
+      m.quota_type !== 0 && (m.model_price ?? 0) > 0
+        ? m.model_price
+        : undefined,
+    quotaType: m.quota_type >= 2 ? m.quota_type : undefined,
+    audioRatio:
+      m.audio_ratio != null && m.audio_ratio > 0 ? m.audio_ratio : undefined,
+    audioCompletionRatio:
+      m.audio_completion_ratio != null && m.audio_completion_ratio > 0
+        ? m.audio_completion_ratio
+        : undefined,
+    billingMode: m.billing_mode || undefined,
+    billingExpr: m.billing_expr || undefined,
+    pricingVersion: m.pricing_version || undefined,
+  }));
+
+  const modelRatios: Record<string, number> = {};
+  const completionRatios: Record<string, number> = {};
+  const audioRatios: Record<string, number> = {};
+  const audioCompletionRatios: Record<string, number> = {};
+  const billingModes: Record<string, string> = {};
+  const billingExprs: Record<string, string> = {};
+  const pricingVersions: Record<string, string> = {};
+  for (const m of data.data) {
+    const ratio = publishedRatio(
+      m.model_ratio,
+      m.completion_ratio,
+      m.group_price,
+    );
+    if (ratio !== undefined && ratio > 0) modelRatios[m.model_name] = ratio;
+    if (m.completion_ratio > 0)
+      completionRatios[m.model_name] = m.completion_ratio;
+    if (m.audio_ratio != null && m.audio_ratio > 0)
+      audioRatios[m.model_name] = m.audio_ratio;
+    if (m.audio_completion_ratio != null && m.audio_completion_ratio > 0)
+      audioCompletionRatios[m.model_name] = m.audio_completion_ratio;
+    if (m.billing_mode) billingModes[m.model_name] = m.billing_mode;
+    if (m.billing_expr) billingExprs[m.model_name] = m.billing_expr;
+    if (m.pricing_version) pricingVersions[m.model_name] = m.pricing_version;
+  }
+
+  const vendorIdToName: Record<number, string> = {};
+  if (data.vendors) for (const v of data.vendors) vendorIdToName[v.id] = v.name;
+
+  consola.info(
+    t("CORE.NEWAPI.V1_FORMAT", {
+      name: ctx.name,
+      groups: groups.length,
+      models: models.length,
+    }),
+  );
+  return {
+    groups,
+    models,
+    groupRatios: data.group_ratio,
+    modelRatios,
+    completionRatios,
+    vendorIdToName,
+    endpointPaths: data.supported_endpoint ?? {},
+    audioRatios,
+    audioCompletionRatios,
+    billingModes,
+    billingExprs,
+    pricingVersions,
+  };
+}
+
+function parsePricingV2(
+  ctx: ClientContext,
+  raw: PricingResponseV2,
+): UpstreamPricing {
+  const d = raw.data;
+  const groupRatios: Record<string, number> = {};
+  const modelRatios: Record<string, number> = {};
+  const completionRatios: Record<string, number> = {
+    ...d.model_completion_ratio,
+  };
+
+  const groups: GroupInfo[] = Object.entries(d.model_group)
+    .filter(([name]) => name !== "")
+    .map(([name, group]) => {
+      const modelNames = Object.keys(group.ModelPrice);
+      groupRatios[name] = group.GroupRatio;
+      for (const [modelName, pricing] of Object.entries(group.ModelPrice)) {
+        if (pricing.price > 0) {
+          const prev = modelRatios[modelName];
+          if (prev === undefined || pricing.price < prev)
+            modelRatios[modelName] = pricing.price;
+        }
+      }
+      return {
+        name,
+        description: group.DisplayName || name,
+        ratio: group.GroupRatio,
+        models: modelNames,
+        channelType: CHANNEL_TYPES.OPENAI,
+      };
+    });
+
+  const allModels = new Map<string, ModelInfo>();
+  for (const [groupName, group] of Object.entries(d.model_group)) {
+    for (const [modelName, pricing] of Object.entries(group.ModelPrice)) {
+      if (!allModels.has(modelName)) {
+        allModels.set(modelName, {
+          name: modelName,
+          ratio: pricing.price || 1,
+          completionRatio: d.model_completion_ratio[modelName] ?? 1,
+          groups: [],
+        });
+      }
+      allModels.get(modelName)!.groups.push(groupName);
+    }
+  }
+  const models = Array.from(allModels.values());
+
+  consola.info(
+    t("CORE.NEWAPI.V2_FORMAT", {
+      name: ctx.name,
+      groups: groups.length,
+      models: models.length,
+    }),
+  );
+  return {
+    groups,
+    models,
+    groupRatios,
+    modelRatios,
+    completionRatios,
+    vendorIdToName: {},
+    endpointPaths: {},
+    audioRatios: {},
+    audioCompletionRatios: {},
+    billingModes: {},
+    billingExprs: {},
+    pricingVersions: {},
+  };
+}
+
+// new-api's per-token base: model_ratio 1 == $2 / M tokens. ephone quotes absolute
+// USD/M, so ratio = usdPerM / 2 recovers the native ratio the rest of the engine wants.
+const USD_PER_M_PER_RATIO = 2;
+
+function endpointsFromModalities(m: {
+  input?: string[];
+  output?: string[];
+}): string[] {
+  const out = m.output ?? [];
+  if (out.includes("video")) return ["openai-video"];
+  return [];
+}
+
+type EphoneConditions = NonNullable<
+  NonNullable<EphoneModel["price_config"]>["original_price"]
+>["conditions"];
+type EphoneCondition = NonNullable<EphoneConditions>[number];
+
+// ephone: price_config.original_price.conditions[].price.
+// - token: ratio + completionRatio + cache/audio/image sub-ratios (LLM). Multi-condition token
+//   is a context-tier surcharge (usage.prompt_tokens >= N); the gateway cannot switch price by
+//   context, so we bill the DOMINANT (highest) condition to never under-bill.
+// - call (per-request flat) and time (per-second): emit a flat modelPrice. Video that routes to a
+//   resolution/duration-capable task adaptor (kling/sora/gemini/vertex/ali) keeps the CHEAPEST
+//   base; the adaptor's EstimateBilling scales up for higher resolutions, so a grid here would
+//   double-count. Image models priced by resolution (no adaptor) emit a real resolution grid.
+//   Everything else uses the DOMINANT flat price. Prices pass through verbatim (the
+//   yuan-labeled-as-USD number is the retail-margin convention used across providers).
+function decodeEphone(m: EphoneModel): ModelInfo | undefined {
+  const conditions = m.price_config?.original_price?.conditions ?? [];
+  const base: ModelInfo = {
+    name: m.model_name,
+    ratio: 1,
+    completionRatio: 1,
+    groups: m.enable_groups ?? [],
+    vendorId: m.vendor_id,
+    supportedEndpoints: endpointsFromModalities(m.modalities ?? {}),
+  };
+  const dominant = dominantCondition(conditions);
+  const price = dominant?.price;
+  if (!price) return base;
+  if (price.quota_type === "token") {
+    const input = price.input_token_price ?? 0;
+    const output = price.output_token_price ?? input;
+    if (input <= 0) return base;
+    base.ratio = input / USD_PER_M_PER_RATIO;
+    base.completionRatio = output > 0 ? output / input : 1;
+    if (price.cache_read_token_price != null)
+      base.cacheRatio = price.cache_read_token_price / input;
+    if (price.cache_create_token_price != null)
+      base.createCacheRatio = price.cache_create_token_price / input;
+    if (price.audio_token_price != null && price.audio_token_price > 0) {
+      base.audioRatio = price.audio_token_price / input;
+      // Gateway bills audio output at audioRatio * audioCompletionRatio, so this ratio is
+      // audio-out / audio-in (not / input).
+      if (
+        price.audio_completion_token_price != null &&
+        price.audio_completion_token_price > 0
+      )
+        base.audioCompletionRatio =
+          price.audio_completion_token_price / price.audio_token_price;
+    }
+    if (price.image_token_price != null && price.image_token_price > 0)
+      base.imageRatio = price.image_token_price / input;
+    return base;
+  }
+  // Image priced by resolution with no task adaptor: emit a per-resolution grid the gateway bills
+  // via GetGridPrice (image output resolution). Distinguish from adaptor-billed video by (a) image
+  // modality, (b) a resolution/size rule, (c) no task-model override.
+  const isImage = (m.modalities?.output ?? []).includes("image");
+  if (isImage && !getTaskModelOverride(m.model_name)) {
+    const grid = conditionsToResolutionGrid(conditions);
+    if (grid) {
+      base.gridRows = grid;
+      base.quotaType = 1;
+      const cheapest = grid.reduce(
+        (min, r) => (r.Pricing < min ? r.Pricing : min),
+        Infinity,
+      );
+      if (Number.isFinite(cheapest)) base.modelPrice = cheapest;
+      return base;
+    }
+  }
+  // Video that routes to a resolution/duration-capable task adaptor bills off the cheapest base
+  // (the adaptor multiplies up); everything else takes the dominant (highest) flat price.
+  const adaptorScales = adaptorScalesResolution(m.model_name);
+  const flat = adaptorScales
+    ? cheapestFlatPrice(conditions)
+    : flatPriceOf(price);
+  if (flat != null && flat > 0) {
+    base.modelPrice = flat;
+    base.quotaType = 1;
+  }
+  return base;
+}
+
+const flatPriceOf = (
+  p: EphoneCondition["price"] | undefined,
+): number | undefined =>
+  p?.per_second_price != null && p.per_second_price > 0
+    ? p.per_second_price
+    : (p?.model_price ?? undefined);
+
+// The condition we bill from: highest input_token_price (token) or highest flat price (media),
+// so a context/resolution surcharge is never under-billed.
+function dominantCondition(
+  conditions: EphoneConditions,
+): EphoneCondition | undefined {
+  let best: EphoneCondition | undefined;
+  let bestVal = -Infinity;
+  for (const c of conditions ?? []) {
+    const p = c.price;
+    if (!p) continue;
+    const v =
+      p.quota_type === "token"
+        ? (p.input_token_price ?? 0)
+        : (flatPriceOf(p) ?? 0);
+    if (v > bestVal) {
+      bestVal = v;
+      best = c;
+    }
+  }
+  return best;
+}
+
+// Task adaptors that apply per-request resolution/duration multipliers (kling/sora/gemini/
+// vertex/ali). For these the flat base must be the CHEAPEST tier; the rest are flat per-call.
+const RES_SCALING_ADAPTORS = new Set<number>([
+  CHANNEL_TYPES.KLING,
+  CHANNEL_TYPES.SORA,
+  CHANNEL_TYPES.GEMINI,
+  CHANNEL_TYPES.VERTEX_AI,
+  CHANNEL_TYPES.ALI,
+]);
+const adaptorScalesResolution = (name: string): boolean => {
+  const t = RES_SCALING_ADAPTORS as Set<number | undefined>;
+  return t.has(getTaskModelOverride(name)?.channelType);
+};
+
+// Lowest per-unit/per-second price across an ephone model's conditions (resolution tiers).
+function cheapestFlatPrice(conditions: EphoneConditions): number | undefined {
+  let min: number | undefined;
+  for (const c of conditions ?? []) {
+    const v = flatPriceOf(c.price);
+    if (v != null && v > 0 && (min === undefined || v < min)) min = v;
+  }
+  return min;
+}
+
+// Build {Resolution, Pricing}[] rows from conditions whose rule selects a resolution/size, so the
+// gateway bills per output resolution via GetGridPrice. Returns undefined when no rule yields a
+// resolution label (then the caller falls back to a flat price).
+function conditionsToResolutionGrid(
+  conditions: EphoneConditions,
+): GridPricingInfo | undefined {
+  const rows: GridPricingInfo = [];
+  let sawLabel = false;
+  for (const c of conditions ?? []) {
+    const price = flatPriceOf(c.price);
+    if (price == null || price <= 0) continue;
+    const label = resolutionLabelFromRule(c.rule ?? "");
+    if (label) sawLabel = true;
+    rows.push({ Resolution: label ?? "default", Pricing: price });
+  }
+  return sawLabel && rows.length > 0 ? rows : undefined;
+}
+
+// Extract a resolution label from an ephone rule string. Handles explicit resolution tokens
+// (720p/2k) and WxH size expressions (max dimension -> nearest label). Empty for non-resolution
+// rules (e.g. context-tier), so the caller keeps the "default" row.
+function resolutionLabelFromRule(rule: string): string | undefined {
+  const explicit = rule.match(/resolution\s*==\s*['"]?(\d+k|\d+p)['"]?/i)?.[1];
+  if (explicit) return explicit.toUpperCase();
+  let maxDim = 0;
+  for (const m of rule.matchAll(/(\d{3,4})\s*[x*:]\s*(\d{3,4})/g)) {
+    const hi = Math.max(Number(m[1]), Number(m[2]));
+    if (hi > maxDim) maxDim = hi;
+  }
+  if (maxDim >= 3840) return "4K";
+  if (maxDim >= 2048) return "2K";
+  if (maxDim >= 1920) return "1080P";
+  if (maxDim >= 1280) return "720P";
+  if (maxDim >= 640) return "480P";
+  return undefined;
+}
+
+// chatfire: price_info[group].default. Native new-api ratios; pick the cheapest
+// enable-group so failover prices off the best lane.
+function decodeChatfire(m: ChatfireModel): ModelInfo | undefined {
+  const groups = Object.entries(m.price_info ?? {});
+  if (!groups.length) return undefined;
+  let best: (typeof groups)[number][1]["default"] | undefined;
+  for (const [, g] of groups) {
+    const d = g.default;
+    if (!d) continue;
+    if (!best || (d.model_ratio ?? Infinity) < (best.model_ratio ?? Infinity))
+      best = d;
+  }
+  if (!best) return undefined;
+  const info: ModelInfo = {
+    name: m.model_name,
+    ratio: best.model_ratio && best.model_ratio > 0 ? best.model_ratio : 1,
+    completionRatio: best.model_completion_ratio ?? 1,
+    groups: m.enable_groups ?? Object.keys(m.price_info ?? {}),
+    vendorId: m.vendor_id,
+    supportedEndpoints: m.supported_endpoint_types ?? [],
+  };
+  if (best.model_cache_ratio != null && best.model_cache_ratio >= 0)
+    info.cacheRatio = best.model_cache_ratio;
+  if (
+    best.model_create_cache_ratio != null &&
+    best.model_create_cache_ratio >= 0
+  )
+    info.createCacheRatio = best.model_create_cache_ratio;
+  if (best.model_audio_ratio != null && best.model_audio_ratio > 0)
+    info.audioRatio = best.model_audio_ratio;
+  if (
+    best.model_audio_completion_ratio != null &&
+    best.model_audio_completion_ratio > 0
+  )
+    info.audioCompletionRatio = best.model_audio_completion_ratio;
+  // per-call (quota_type 0) flat price; grid/special (>=2) forwarded as quotaType.
+  if (best.quota_type === 0 && (best.model_price ?? 0) > 0) {
+    info.modelPrice = best.model_price;
+    info.quotaType = 1;
+  } else if (best.quota_type >= 2) {
+    info.quotaType = best.quota_type;
+  }
+  return info;
+}
+
+function parsePricingV3(
+  ctx: ClientContext,
+  raw: PricingResponseV3,
+): UpstreamPricing {
+  const d = raw.data;
+  const rows = d.model_info ?? [];
+  const isEphone = rows.some(
+    (m) => (m as EphoneModel).price_config !== undefined,
+  );
+
+  const models: ModelInfo[] = [];
+  for (const row of rows) {
+    const info = isEphone
+      ? decodeEphone(row as EphoneModel)
+      : decodeChatfire(row as ChatfireModel);
+    if (info) models.push(info);
+  }
+
+  const groupRatios: Record<string, number> = {};
+  for (const [name, g] of Object.entries(d.group_info ?? {}))
+    if (name !== "") groupRatios[name] = g.GroupRatio ?? 1;
+
+  const groupModels = new Map<string, Set<string>>();
+  for (const info of models)
+    for (const group of info.groups) {
+      if (!groupModels.has(group)) groupModels.set(group, new Set());
+      groupModels.get(group)!.add(info.name);
+    }
+  const groups: GroupInfo[] = Object.entries(d.group_info ?? {})
+    .filter(([name]) => name !== "")
+    .map(([name, g]) => ({
+      name,
+      description: g.DisplayNameEn || g.DisplayName || name,
+      ratio: g.GroupRatio ?? 1,
+      models: Array.from(groupModels.get(name) ?? []),
+      channelType: CHANNEL_TYPES.OPENAI,
+    }));
+
+  const modelRatios: Record<string, number> = {};
+  const completionRatios: Record<string, number> = {};
+  const audioRatios: Record<string, number> = {};
+  const audioCompletionRatios: Record<string, number> = {};
+  for (const info of models) {
+    if (info.ratio !== undefined && info.ratio > 0)
+      modelRatios[info.name] = info.ratio;
+    if (info.completionRatio > 0)
+      completionRatios[info.name] = info.completionRatio;
+    if (info.audioRatio != null) audioRatios[info.name] = info.audioRatio;
+    if (info.audioCompletionRatio != null)
+      audioCompletionRatios[info.name] = info.audioCompletionRatio;
+  }
+
+  const vendorIdToName: Record<number, string> = {};
+  for (const v of d.vendor_info ?? []) vendorIdToName[v.id] = v.name;
+
+  consola.info(
+    t("CORE.NEWAPI.V1_FORMAT", {
+      name: ctx.name,
+      groups: groups.length,
+      models: models.length,
+    }),
+  );
+  return {
+    groups,
+    models,
+    groupRatios,
+    modelRatios,
+    completionRatios,
+    vendorIdToName,
+    endpointPaths: {},
+    audioRatios,
+    audioCompletionRatios,
+    billingModes: {},
+    billingExprs: {},
+    pricingVersions: {},
+  };
+}

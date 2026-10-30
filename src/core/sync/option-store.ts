@@ -1,0 +1,441 @@
+import {
+  groupsOnChannels,
+  modelsOnChannels,
+  parseModelList,
+} from "@core/catalog/constants/patterns";
+import type { Channel, PricingAudit } from "@core/types";
+import {
+  GROUP_OPTION_KEYS,
+  MANAGED_OPTION_KEYS,
+  MODEL_OPTION_KEYS,
+  PRICING_KEYS,
+} from "@core/types";
+import type { NewApiClient } from "@core/vendors/newapi/client";
+import { t } from "@server/i18n";
+import { consola } from "consola";
+import stringify from "safe-stable-stringify";
+
+export function parseJsonObject(
+  raw: string | undefined,
+): Record<string, unknown> {
+  try {
+    const v: unknown = JSON.parse(raw ?? "");
+    return v !== null && typeof v === "object" && !Array.isArray(v)
+      ? { ...v }
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseJsonStringArray(raw: string | undefined): string[] {
+  try {
+    const v: unknown = JSON.parse(raw ?? "");
+    return Array.isArray(v)
+      ? v.filter((x): x is string => typeof x === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+// Subscription tiers bill through GroupRatio without owning a channel, so it is
+// never pruned; these names are never pruned from any group map.
+const BASE_GROUPS = new Set(["default", "auto", "vip", "svip"]);
+
+// Additive keys land before subtractive ones: a group must be priced before it
+// is usable or auto, and a model's flat price must exist before its ratio goes.
+const FLUSH_ORDER: readonly string[] = [
+  "GroupRatio",
+  "UserUsableGroups",
+  "AutoGroups",
+  "ModelPrice",
+  "billing_setting.billing_mode",
+  "billing_setting.billing_expr",
+  "ModelQuotaType",
+  "ModelGridPricing",
+  "ModelRatio",
+  "CompletionRatio",
+  ...MANAGED_OPTION_KEYS,
+];
+
+const OBJECT_KEYS = new Set<string>([
+  ...GROUP_OPTION_KEYS.filter((k) => k !== "AutoGroups"),
+  ...MODEL_OPTION_KEYS,
+]);
+
+export interface OptionSettlement extends PricingAudit {
+  changed: string[];
+  // Groups whose ratio followed a moved ModelRatio so their sell price held.
+  rescaled: string[];
+}
+
+export interface OptionFlush extends PricingAudit {
+  written: string[];
+  errors: { key: string; message: string }[];
+}
+
+export function printPricingAudit(
+  audit: PricingAudit,
+  unpriced: string[],
+): void {
+  for (const d of audit.dropped)
+    consola.warn(`[pricing-audit] dropped ${d.key}: ${d.names.join(", ")}`);
+  const errors = audit.healed.map(
+    (h) => `healed ${h.key}: ${h.names.join(", ")}`,
+  );
+  if (unpriced.length > 0)
+    errors.push(`unpriced on enabled channels: ${unpriced.join(", ")}`);
+  if (errors.length === 0) {
+    consola.info("[pricing-audit] clean");
+    return;
+  }
+  for (const line of errors) consola.error(`[pricing-audit] ${line}`);
+}
+
+export class OptionStore {
+  private readonly before: Record<string, string | undefined>;
+  private next: Record<string, string | undefined>;
+
+  private constructor(options: Record<string, string>) {
+    this.before = { ...options };
+    this.next = { ...options };
+  }
+
+  static async load(client: NewApiClient): Promise<OptionStore> {
+    return new OptionStore(await client.getOptions([...MANAGED_OPTION_KEYS]));
+  }
+
+  static fromRaw(options: Record<string, string>): OptionStore {
+    return new OptionStore(options);
+  }
+
+  raw(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(this.next))
+      if (v !== undefined) out[k] = v;
+    return out;
+  }
+
+  object(key: string): Record<string, unknown> {
+    return parseJsonObject(this.next[key]);
+  }
+
+  autoGroups(): string[] {
+    return parseJsonStringArray(this.next["AutoGroups"]);
+  }
+
+  replace(key: string, value: string): void {
+    this.next[key] = value;
+  }
+
+  private writeObject(key: string, value: Record<string, unknown>): void {
+    this.next[key] = stringify(value) ?? "{}";
+  }
+
+  private writeAutoGroups(auto: string[]): void {
+    this.next["AutoGroups"] = JSON.stringify(auto);
+  }
+
+  setEntries(key: string, entries: Record<string, unknown>): void {
+    const map = this.object(key);
+    for (const [name, value] of Object.entries(entries)) map[name] = value;
+    this.writeObject(key, map);
+  }
+
+  deleteEntries(key: string, names: Iterable<string>): void {
+    const map = this.object(key);
+    for (const name of names) delete map[name];
+    this.writeObject(key, map);
+  }
+
+  private sortedAuto(
+    auto: Iterable<string>,
+    ratio = this.object("GroupRatio"),
+  ): string[] {
+    const ratioOf = (g: string) => {
+      const r = ratio[g];
+      return typeof r === "number" ? r : 1;
+    };
+    return [...new Set(auto)].sort((a, b) => ratioOf(a) - ratioOf(b));
+  }
+
+  // Additive only: entries are added or updated, never removed. A run only
+  // prices the models that passed ITS probe, so removal by omission would drop
+  // every group whose model merely throttled during the probe. Removal is
+  // pruneGroups, which sees the full channel list.
+  mergeGroups(groups: {
+    ratio?: Record<string, number>;
+    usable?: Record<string, string>;
+    auto?: string[];
+  }): void {
+    if (groups.ratio) this.setEntries("GroupRatio", groups.ratio);
+    this.setEntries("UserUsableGroups", {
+      auto: t("CORE.GROUPS.AUTO_LABEL"),
+      ...groups.usable,
+    });
+    this.writeAutoGroups(
+      this.sortedAuto([...this.autoGroups(), ...(groups.auto ?? [])]),
+    );
+  }
+
+  // Groups no channel carries linger in UserUsableGroups/AutoGroups and the token
+  // group picker then offers unroutable pins. Returns the pruned names.
+  pruneGroups(liveGroups: Set<string>, protect: Set<string>): string[] {
+    const keep = (g: string) =>
+      BASE_GROUPS.has(g) || liveGroups.has(g) || protect.has(g);
+    const pruned = new Set<string>();
+    const usable = this.object("UserUsableGroups");
+    for (const g of Object.keys(usable))
+      if (!keep(g)) {
+        delete usable[g];
+        pruned.add(g);
+      }
+    this.writeObject("UserUsableGroups", usable);
+    const auto = this.autoGroups();
+    for (const g of auto) if (!keep(g)) pruned.add(g);
+    this.writeAutoGroups(auto.filter(keep));
+    const names = [...pruned].sort();
+    if (names.length > 0)
+      consola.info(
+        t("CORE.SYNC.DEAD_GROUPS_PRUNED", {
+          count: names.length,
+          names: names.join(", "),
+        }),
+      );
+    return names;
+  }
+
+  // Phase "add" copies every old key to the new name; "remove" drops the old
+  // keys. Two phases so a token pinned to both names never points at a group
+  // the gateway lacks.
+  renameGroups(
+    renames: ReadonlyArray<{ from: string; to: string }>,
+    phase: "add" | "remove",
+  ): void {
+    const ratio = this.object("GroupRatio");
+    const usable = this.object("UserUsableGroups");
+    let auto = this.autoGroups();
+    for (const { from, to } of renames) {
+      if (phase === "add") {
+        if (from in ratio && !(to in ratio)) ratio[to] = ratio[from];
+        if (from in usable && !(to in usable)) usable[to] = usable[from];
+        if (auto.includes(from) && !auto.includes(to)) auto.push(to);
+      } else {
+        delete ratio[from];
+        delete usable[from];
+        auto = auto.filter((g) => g !== from);
+      }
+    }
+    this.writeObject("GroupRatio", ratio);
+    this.writeObject("UserUsableGroups", usable);
+    this.writeAutoGroups(this.sortedAuto(auto));
+  }
+
+  private isDirty(key: string): boolean {
+    const a = this.before[key];
+    const b = this.next[key];
+    if (a === b) return false;
+    if (b === undefined) return false;
+    if (a === undefined) return true;
+    if (key === "AutoGroups")
+      return (
+        JSON.stringify(parseJsonStringArray(a)) !==
+        JSON.stringify(parseJsonStringArray(b))
+      );
+    if (OBJECT_KEYS.has(key))
+      return stringify(parseJsonObject(a)) !== stringify(parseJsonObject(b));
+    return true;
+  }
+
+  dirtyKeys(): string[] {
+    return FLUSH_ORDER.filter(
+      (k, i) => FLUSH_ORDER.indexOf(k) === i && this.isDirty(k),
+    );
+  }
+
+  unpricedLiveModels(channels: Channel[]): string[] {
+    const priced = PRICING_KEYS.map((k) => this.object(k));
+    return [
+      ...modelsOnChannels(channels, {
+        enabledOnly: true,
+        includeAliases: false,
+      }),
+    ]
+      .filter((m) => !priced.some((map) => m in map))
+      .sort();
+  }
+
+  // The one invariant every option write is held to: a model an enabled channel
+  // serves keeps at least one price, and a group any channel carries keeps its
+  // entries. Endangered entries are carried forward from the loaded values and
+  // reported; the rest of the write proceeds.
+  settle(channels: Channel[]): OptionSettlement {
+    const dropped: OptionSettlement["dropped"] = [];
+    const healed: OptionSettlement["healed"] = [];
+    const live = modelsOnChannels(channels, {
+      enabledOnly: true,
+      includeAliases: false,
+    });
+    const pricedBefore = PRICING_KEYS.map((k) =>
+      parseJsonObject(this.before[k]),
+    );
+    const pricedAfter = PRICING_KEYS.map((k) => this.object(k));
+    const endangered = [...live].filter(
+      (m) =>
+        pricedBefore.some((x) => m in x) && !pricedAfter.some((x) => m in x),
+    );
+    if (endangered.length > 0)
+      for (const key of MODEL_OPTION_KEYS) {
+        const was = parseJsonObject(this.before[key]);
+        const names = endangered.filter((m) => m in was);
+        if (names.length === 0) continue;
+        this.setEntries(key, Object.fromEntries(names.map((m) => [m, was[m]])));
+        healed.push({ key, names: names.sort() });
+      }
+    const carried = groupsOnChannels(channels, { enabledOnly: false });
+    for (const key of GROUP_OPTION_KEYS) {
+      if (key === "AutoGroups") {
+        const was = parseJsonStringArray(this.before[key]);
+        const now = new Set(this.autoGroups());
+        const names = was.filter((g) => carried.has(g) && !now.has(g));
+        if (names.length === 0) continue;
+        this.writeAutoGroups(this.sortedAuto([...now, ...names]));
+        healed.push({ key, names: names.sort() });
+        continue;
+      }
+      const was = parseJsonObject(this.before[key]);
+      const now = this.object(key);
+      const names = Object.keys(was).filter(
+        (g) => carried.has(g) && !(g in now),
+      );
+      if (names.length === 0) continue;
+      this.setEntries(key, Object.fromEntries(names.map((g) => [g, was[g]])));
+      healed.push({ key, names: names.sort() });
+    }
+    for (const key of PRICING_KEYS) {
+      if (!this.isDirty(key)) continue;
+      const after = this.object(key);
+      const names = Object.keys(parseJsonObject(this.before[key])).filter(
+        (m) => !(m in after),
+      );
+      if (names.length > 0) dropped.push({ key, names: names.sort() });
+    }
+    const rescaled = this.rescaleFollowers(channels);
+    return { changed: this.dirtyKeys(), dropped, healed, rescaled };
+  }
+
+  // A lane sells at ModelRatio * GroupRatio. A run that re-bases a model writes
+  // new group ratios only for the lanes it manages; every other lane serving the
+  // model kept a ratio computed against the old base and its price moved with
+  // it (open1-novita sold deepseek-v4.1-flash at a quarter of cost after an a7
+  // run re-based it). Groups this flush does not rewrite follow the base.
+  private rescaleFollowers(channels: Channel[]): string[] {
+    const ratioBefore = parseJsonObject(this.before["ModelRatio"]);
+    const ratioAfter = this.object("ModelRatio");
+    const groupBefore = parseJsonObject(this.before["GroupRatio"]);
+    const groupAfter = this.object("GroupRatio");
+    const factors = new Map<string, number>();
+    for (const [model, was] of Object.entries(ratioBefore)) {
+      const now = ratioAfter[model];
+      if (
+        typeof was !== "number" ||
+        typeof now !== "number" ||
+        was <= 0 ||
+        now <= 0 ||
+        was === now
+      )
+        continue;
+      factors.set(model, was / now);
+    }
+    if (factors.size === 0) return [];
+    const rescaled: Record<string, number> = {};
+    for (const ch of channels) {
+      for (const raw of (ch.group ?? "").split(",")) {
+        const g = raw.trim();
+        if (!g || g in rescaled) continue;
+        const old = groupBefore[g];
+        if (typeof old !== "number" || groupAfter[g] !== old) continue;
+        for (const model of parseModelList(ch.models ?? "")) {
+          const factor = factors.get(model);
+          if (factor === undefined) continue;
+          rescaled[g] = Math.round(old * factor * 10000) / 10000;
+          break;
+        }
+      }
+    }
+    const names = Object.keys(rescaled).sort();
+    if (names.length > 0) this.setEntries("GroupRatio", rescaled);
+    return names;
+  }
+
+  async flush(client: NewApiClient, channels: Channel[]): Promise<OptionFlush> {
+    const plan = this.settle(channels);
+    const written: string[] = [];
+    const errors: OptionFlush["errors"] = [];
+    for (const { key, names } of plan.dropped)
+      consola.warn(
+        `[option-store] ${key} drops ${names.length} model(s): ${names.join(", ")}`,
+      );
+    for (const { key, names } of plan.healed) {
+      const message = `healed ${names.length} entr${names.length === 1 ? "y" : "ies"} kept at last value: ${names.join(", ")}`;
+      consola.error(`[option-store] ${key}: ${message}`);
+      errors.push({ key, message });
+    }
+    if (plan.rescaled.length > 0)
+      consola.info(
+        `[option-store] GroupRatio: ${plan.rescaled.length} group(s) followed a moved ModelRatio: ${plan.rescaled.join(", ")}`,
+      );
+    for (const key of plan.changed) {
+      const value = await this.rebase(client, key);
+      if (value === undefined) continue;
+      if (await client.updateOption(key, value)) {
+        written.push(key);
+        this.before[key] = value;
+        // Else a later flush reads another writer's merged entries as ones this run dropped.
+        this.next[key] = value;
+      } else errors.push({ key, message: "option write failed" });
+    }
+    return { written, errors, dropped: plan.dropped, healed: plan.healed };
+  }
+
+  // A run holds the options it loaded for as long as it runs (the cluster's full
+  // run took 77 minutes on 2026-09-21), so writing that picture back whole erased
+  // what a local run published meanwhile: cfp4..cfp8 and five new cfp models lost
+  // their routing that way, twice. Only this run's own edits are replayed onto the
+  // value as it stands now.
+  private async rebase(
+    client: NewApiClient,
+    key: string,
+  ): Promise<string | undefined> {
+    const mine = this.next[key];
+    if (mine === undefined) return undefined;
+    const loaded = this.before[key];
+    const live = (await client.getOptions([key]))[key];
+    if (live === undefined || live === loaded) return mine;
+    if (key === "AutoGroups") {
+      const was = new Set(parseJsonStringArray(loaded));
+      const now = parseJsonStringArray(mine);
+      const kept = new Set(now);
+      const merged = parseJsonStringArray(live).filter(
+        (g) => !was.has(g) || kept.has(g),
+      );
+      // GroupRatio flushes first, so this read already holds both runs' groups.
+      const ratio = parseJsonObject(
+        (await client.getOptions(["GroupRatio"]))["GroupRatio"],
+      );
+      return JSON.stringify(
+        this.sortedAuto([...merged, ...now.filter((g) => !was.has(g))], ratio),
+      );
+    }
+    if (!OBJECT_KEYS.has(key)) return mine;
+    const was = parseJsonObject(loaded);
+    const now = parseJsonObject(mine);
+    const merged = parseJsonObject(live);
+    for (const name of Object.keys(was))
+      if (!(name in now)) delete merged[name];
+    for (const [name, value] of Object.entries(now))
+      if (stringify(was[name]) !== stringify(value)) merged[name] = value;
+    return stringify(merged) ?? "{}";
+  }
+}

@@ -1,0 +1,428 @@
+import { toBareName } from "@core/catalog/bare-name";
+import { inferModelType } from "@core/catalog/constants/inference";
+import { type BasellmEntry, lookup } from "@core/catalog/metadata";
+import type { ModelType } from "@core/types";
+import { t } from "@server/i18n";
+import { fetchAipricingSource } from "./sources/aipricing";
+import { buildBasellmCanonicalSource } from "./sources/basellm";
+import {
+  buildCuratedSource,
+  CURATED_OVERRIDE,
+  CURATED_PRICING,
+} from "./sources/curated";
+import { fetchEphoneMetadataSource } from "./sources/ephone";
+import { fetchGenaiPricesSource } from "./sources/genai-prices";
+import { fetchLiteLLMSource } from "./sources/litellm";
+import { fetchLlmPricesSource } from "./sources/llm-prices";
+import { fetchModelsDevSource } from "./sources/models-dev";
+import { fetchOpenRouterPricingSource } from "./sources/openrouter";
+import {
+  fetchRunwareSchemas,
+  lookupImageParams,
+  type RunwareSchemaIndex,
+} from "./sources/runware";
+import type {
+  BaseModelPricing,
+  PricingSource,
+  ResolvedMetadata,
+  SourceMetadata,
+} from "./sources/types";
+
+// Module state, declared above its first use: a `let` stays in the temporal dead
+// zone until its own line executes, so loading into it from a call higher in the
+// file leaves the value reset to null.
+let runwareSchemas: RunwareSchemaIndex | null = null;
+
+async function loadRunwareSchemas(): Promise<void> {
+  runwareSchemas = await fetchRunwareSchemas();
+}
+
+export async function fetchAllPricingSources(
+  basellmEntries: BasellmEntry[],
+): Promise<PricingSource[]> {
+  // Loaded alongside the sources so both sync entry points get it without either
+  // having to remember; image capability flags are resolved from it downstream.
+  const runwareLoad = loadRunwareSchemas();
+  const [
+    llmPrices,
+    litellm,
+    openrouter,
+    modelsDev,
+    aipricing,
+    genaiPrices,
+    ephone,
+  ] = await Promise.all([
+    fetchLlmPricesSource(),
+    fetchLiteLLMSource(),
+    fetchOpenRouterPricingSource(),
+    fetchModelsDevSource(),
+    fetchAipricingSource(),
+    fetchGenaiPricesSource(),
+    fetchEphoneMetadataSource(),
+  ]);
+  const basellm = buildBasellmCanonicalSource(basellmEntries);
+  await runwareLoad;
+
+  const empty: string[] = [];
+  if (!litellm || litellm.pricing.candidates.size === 0) empty.push("LiteLLM");
+  if (!openrouter || openrouter.pricing.candidates.size === 0)
+    empty.push("OpenRouter");
+  // basellm publishes no ratio fields, only metadata (tags, context window), so
+  // requiring pricing from it aborted every sync once its last ratios went away.
+  if (!basellm) empty.push("basellm");
+  if (empty.length > 0) {
+    throw new Error(
+      t("ERROR.PRICING_EMPTY_SOURCES", { sources: empty.join(", ") }),
+    );
+  }
+
+  return [
+    llmPrices,
+    basellm,
+    litellm,
+    openrouter,
+    modelsDev,
+    aipricing,
+    genaiPrices,
+    // ePhone metadata (description/release/cutoff/context/tags) fills gaps the
+    // pricing-focused live sources leave blank, esp. Chinese-vendor video/audio
+    // + fresh flagships. Array order = priority (earlier wins via the reverse
+    // Object.assign in resolveOneName), so ePhone outranks curated: ePhone ships
+    // real catalog dates for models curated only hand-guessed.
+    ephone,
+    // last = lowest priority: only fills gaps every other source left blank
+    buildCuratedSource(),
+  ].filter((s): s is PricingSource => s != null);
+}
+
+export function resolveBasePricing(
+  modelName: string,
+  sources: PricingSource[],
+  reverseMapping: Map<string, string>,
+): BaseModelPricing | undefined {
+  const pinned = CURATED_PRICING[modelName];
+  if (pinned) return pinned;
+  for (const source of sources) {
+    const hit = lookup(modelName, source.pricing, reverseMapping);
+    if (!hit) continue;
+    if (hit.value.cacheRatio !== undefined && hit.value.cacheRatio > 0)
+      return hit.value;
+    const cacheRatio = resolveCacheRatio(modelName, sources, reverseMapping);
+    return cacheRatio === undefined ? hit.value : { ...hit.value, cacheRatio };
+  }
+  return undefined;
+}
+
+// The list's output/input ratio, taken only from sources whose input price agrees
+// with the voted one: LiteLLM listed deepseek-v4.1-flash at $0.01 in and $1.20 out
+// (a cache price in the input field), and as the first source its 120 billed every
+// lane's output 30x for 17 hours on 2026-10-17. Upper middle, so a split list
+// bills the dearer shape.
+export function resolveListCompletionRatio(
+  modelName: string,
+  sources: PricingSource[],
+  reverseMapping: Map<string, string>,
+  listRatio: number,
+): number | undefined {
+  const pinned = CURATED_PRICING[modelName];
+  if (pinned) return pinned.completionRatio;
+  const ratios: number[] = [];
+  for (const source of sources) {
+    const hit = lookup(modelName, source.pricing, reverseMapping);
+    const v = hit?.value;
+    if (!v || v.completionRatio === undefined || v.completionRatio <= 0)
+      continue;
+    if (
+      Math.abs(v.modelRatio - listRatio) >
+      0.25 * Math.max(v.modelRatio, listRatio)
+    )
+      continue;
+    ratios.push(v.completionRatio);
+  }
+  if (ratios.length === 0) return undefined;
+  ratios.sort((a, b) => a - b);
+  return ratios[Math.ceil((ratios.length - 1) / 2)];
+}
+
+// The cache discount as a fraction of input, the median over every source that
+// states one. Sources disagree widely (2% to 22% for deepseek-v4.1-flash), so
+// taking whichever one priced the model first flipped it on every run, and a run
+// where none matched billed cache reads at the full input rate.
+export function resolveCacheRatio(
+  modelName: string,
+  sources: PricingSource[],
+  reverseMapping: Map<string, string>,
+): number | undefined {
+  const pinned = CURATED_PRICING[modelName]?.cacheRatio;
+  if (pinned !== undefined) return pinned;
+  const ratios: number[] = [];
+  for (const source of sources) {
+    const ratio = lookup(modelName, source.pricing, reverseMapping)?.value
+      .cacheRatio;
+    // Zero is a reseller's free cache, never a list price: it billed glm-5.3 cache reads at nothing.
+    if (ratio !== undefined && ratio > 0 && ratio <= 1) ratios.push(ratio);
+  }
+  if (ratios.length === 0) return undefined;
+  ratios.sort((a, b) => a - b);
+  return ratios[Math.floor((ratios.length - 1) / 2)];
+}
+
+/**
+ * The middle offer among every source that prices the model, ordered by input
+ * price. Used when no two sources agree: the top source alone wrote one cloud
+ * host's price (litellm's deepseek-v4.1-flash at $0.01 in, $1.20 out against
+ * $0.19/$0.77 and $0.24/$1.16 elsewhere). Ordering by input plus output would
+ * still pick it, its inflated output lands it in the middle. With an even count
+ * the cheaper of the two middle offers wins.
+ */
+export function resolveMedianPricing(
+  modelName: string,
+  sources: PricingSource[],
+  reverseMapping: Map<string, string>,
+): BaseModelPricing | undefined {
+  const hits: BaseModelPricing[] = [];
+  for (const source of sources) {
+    const hit = lookup(modelName, source.pricing, reverseMapping);
+    if (hit && hit.value.modelRatio > 0) hits.push(hit.value);
+  }
+  if (hits.length === 0) return undefined;
+  hits.sort((a, b) => a.modelRatio - b.modelRatio);
+  return hits[Math.floor((hits.length - 1) / 2)];
+}
+
+// OpenRouter/basellm ship blurbs cut mid-sentence with a trailing ellipsis
+// ("...reasoning effort levels (low, medium, high, max,..."). A higher-priority
+// source with a truncated description must not clobber a full one from a lower
+// source (ePhone ships the complete text).
+export function looksTruncated(desc: string): boolean {
+  return /(?:[,.]\s*)?\.\.\.\s*$/.test(desc.trimEnd());
+}
+
+function resolveOneName(
+  modelName: string,
+  sources: PricingSource[],
+  reverseMapping: Map<string, string>,
+): ResolvedMetadata {
+  const merged: SourceMetadata = {};
+  const hits = sources.map((s) =>
+    lookup(modelName, s.metadata, reverseMapping),
+  );
+  // A source lacking this model falls back to a sibling (minimax-m2-her -> minimax-m2).
+  // Sibling fields only fill gaps: every exact hit applies after them, whatever its
+  // source priority, so the model's own context and description always win.
+  const order = [...hits.keys()]
+    .reverse()
+    .sort(
+      (a, b) =>
+        Number(hits[a]?.exact ?? false) - Number(hits[b]?.exact ?? false),
+    );
+  let descriptionExact = false;
+  for (const i of order) {
+    const hit = hits[i];
+    if (!hit) continue;
+    const incoming = hit.value;
+    // Higher priority applies last; keep an existing full description when the
+    // incoming one is truncated, but only one written for this same model.
+    const keepDescription =
+      incoming.description &&
+      merged.description &&
+      looksTruncated(incoming.description) &&
+      !looksTruncated(merged.description) &&
+      (descriptionExact || !hit.exact);
+    if (incoming.description && !keepDescription) descriptionExact = hit.exact;
+    if (keepDescription) {
+      const keep = merged.description;
+      Object.assign(merged, incoming);
+      merged.description = keep;
+    } else {
+      Object.assign(merged, incoming);
+    }
+  }
+  // Corrections that win over every live source (verified known-wrong upstreams).
+  const override = CURATED_OVERRIDE[modelName];
+  if (override) Object.assign(merged, override);
+  // Sort key derived once here rather than by every consumer: releaseDate stays
+  // the human-readable ISO string the model pages render, releaseTs is the epoch
+  // the catalog sorts on. Always emitted, 0 when the model has no release date,
+  // so consumers read a number instead of re-deriving one.
+  const ms = merged.releaseDate ? Date.parse(merged.releaseDate) : NaN;
+  return { ...merged, releaseTs: Number.isFinite(ms) ? ms : 0 };
+}
+
+// DashScope/relay task-endpoint suffixes (kling-3.0-turbo/image-to-video,
+// viduq3-pro/text-to-video, eleven_flash_v2_5/text-to-speech). These publish with
+// the suffix intact (bare-name collision keeps the full id), but the task word
+// carries no metadata - resolve the base model identity instead. Stripped BEFORE
+// toBareName so the base survives (toBareName would keep only the task word).
+const TASK_SUFFIX =
+  /\/(?:image|text|start-end|video|audio|speech)-to-(?:video|image|speech|text|audio)$/;
+
+export function resolveSourceMetadata(
+  modelName: string,
+  sources: PricingSource[],
+  reverseMapping: Map<string, string>,
+): ResolvedMetadata {
+  const detasked = modelName.replace(TASK_SUFFIX, "");
+  // A `{model}:free` published name has no metadata key of its own; fuzzy-matching
+  // the literal `:free` lands on a wrong dateless candidate, so resolve the bare
+  // identity (real date/description). The suffix carries no unique metadata.
+  const bare = toBareName(detasked);
+  return resolveOneName(
+    bare === modelName ? modelName : bare,
+    sources,
+    reverseMapping,
+  );
+}
+
+// Only OpenRouter publishes output_modalities, so the ~55% of models resolved
+// from other sources reach consumers with nothing to filter on. Derive it from
+// the model type, which every model has, so downstream never has to re-infer
+// modality from the name.
+const TYPE_OUTPUT_MODALITY: Record<ModelType, string> = {
+  text: "text",
+  image: "image",
+  video: "video",
+  audio: "audio",
+  embedding: "embedding",
+};
+
+// The "audio" type covers both directions, so the type alone cannot say which
+// side the audio sits on: transcription takes audio and emits text, speech
+// synthesis does the reverse. Without this split every whisper/asr model was
+// published as audio-OUT, i.e. as if it generated speech.
+const SPEECH_TO_TEXT_PATTERNS = [
+  "whisper",
+  "scribe",
+  "-asr",
+  "asr-",
+  "speech-to-text",
+  "transcri",
+];
+
+const isSpeechToText = (modelName: string, mode: string) => {
+  if (mode === "audio_transcription") return true;
+  const n = modelName.toLowerCase();
+  return SPEECH_TO_TEXT_PATTERNS.some((p) => n.includes(p));
+};
+
+const modeOf = (md: Record<string, unknown>): string =>
+  typeof md.mode === "string" ? md.mode : "";
+
+// An edit/i2i model takes the image it edits as input, which no source
+// publishes and no capability flag covers (supportsVision describes a chat
+// model reading an image, not an image pipeline consuming one).
+const IMAGE_INPUT_PATTERNS = [
+  "-edit",
+  "edit-",
+  "seededit",
+  "kontext",
+  "inpaint",
+  "i2i",
+  "i2v",
+  "img2img",
+];
+
+const takesImageInput = (modelName: string) => {
+  const n = modelName.toLowerCase();
+  return IMAGE_INPUT_PATTERNS.some((p) => n.includes(p));
+};
+
+// Every other modality is prompted by text (image/video gen take a prompt,
+// embeddings embed text, TTS reads text), so text is the floor when no source
+// published input_modalities. The capability flags are set from the same
+// sources, so they carry the extra inputs a multimodal chat model accepts.
+function inputFallback(
+  modelName: string,
+  type: ModelType,
+  md: Record<string, unknown>,
+): string[] {
+  if (type === "audio" && isSpeechToText(modelName, modeOf(md)))
+    return ["audio"];
+  const inputs = ["text"];
+  for (const [flag, modality] of [
+    ["supportsVision", "image"],
+    ["supportsAudio", "audio"],
+    ["supportsVideo", "video"],
+    ["supportsPdf", "file"],
+  ] as const) {
+    if (md[flag]) inputs.push(modality);
+  }
+  if (!inputs.includes("image") && takesImageInput(modelName))
+    inputs.push("image");
+  return inputs;
+}
+
+export function buildModelMetadata(opts: {
+  modelName: string;
+  sources: PricingSource[];
+  reverseMapping: Map<string, string>;
+  override?: Record<string, unknown>;
+  modelType?: ModelType;
+}): Record<string, unknown> | undefined {
+  const merged: Record<string, unknown> = {
+    ...resolveSourceMetadata(opts.modelName, opts.sources, opts.reverseMapping),
+  };
+  // The description is written to its own column by both callers; keeping it here
+  // too duplicated ~167KB across the pricing payload for a field nothing reads.
+  delete merged.description;
+  if (opts.override) {
+    for (const [k, v] of Object.entries(opts.override))
+      if (v !== undefined) merged[k] = v;
+  }
+  // After the override so a curated correction wins. Source values are kept as
+  // published (gemini image models genuinely emit ["image","text"]), EXCEPT when
+  // a source claims text-only for a model we classify as non-text: OpenRouter
+  // publishes output_modalities ["text"] for its embedding and reranker models,
+  // which reads as chat-capable downstream and put 15 of them in the chat picker.
+  // A curated entry is exempt from that correction: the whole reason a model is
+  // curated is that the type-derived guess is the thing that was wrong (an OCR
+  // model typed image emits text, a moderation classifier emits neither).
+  // A source's speech mode outranks the name: aura-1 and melotts carry no
+  // audio keyword and would be typed text, publishing text out for a voice.
+  const mode = modeOf(merged);
+  const type: ModelType = mode.startsWith("audio")
+    ? "audio"
+    : (opts.modelType ?? inferModelType(opts.modelName));
+  const curatedOutputs =
+    CURATED_OVERRIDE[toBareName(opts.modelName)]?.outputModalities;
+  const existing = merged.outputModalities;
+  const published = Array.isArray(existing) ? existing : [];
+  const textOnly = published.length === 1 && published[0] === "text";
+  if (!Array.isArray(curatedOutputs)) {
+    if (type === "audio" && isSpeechToText(opts.modelName, mode)) {
+      merged.outputModalities = ["text"];
+    } else if (published.length === 0 || (textOnly && type !== "text")) {
+      merged.outputModalities = [TYPE_OUTPUT_MODALITY[type]];
+    }
+  }
+  const publishedInputs = merged.inputModalities;
+  if (!Array.isArray(publishedInputs) || publishedInputs.length === 0) {
+    merged.inputModalities = inputFallback(opts.modelName, type, merged);
+  }
+  // Runware is the authority on which generation controls an image model accepts,
+  // so the flags are resolved once here rather than by every client that renders
+  // a form. Derived after the type checks above, which decide what `image` means.
+  if (type === "image" && runwareSchemas) {
+    const series = typeof merged.series === "string" ? merged.series : null;
+    const params = lookupImageParams(runwareSchemas, opts.modelName, series);
+    if (params) merged.imageParams = params;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+export function deriveTagsFromMetadata(md: SourceMetadata): string[] {
+  const tags: string[] = [];
+  // prettier-ignore
+  const flags: Array<[keyof SourceMetadata, string]> = [["isReasoning","Reasoning"],["supportsTools","Tools"],["supportsVision","Vision"],["supportsAudio","Audio"],["supportsVideo","Video"],["supportsPdf","Files"],["supportsCache","Cache"],["supportsWebSearch","WebSearch"],["supportsComputerUse","ComputerUse"]];
+  for (const [key, label] of flags) if (md[key]) tags.push(label);
+
+  const ctx = md.contextWindow ?? md.maxInputTokens;
+  if (ctx != null && ctx > 0) {
+    const fmt = (n: number, unit: string) =>
+      `${n === Math.floor(n) ? n : n.toFixed(1)}${unit}`;
+    if (ctx >= 1_000_000) tags.push(fmt(ctx / 1_000_000, "M"));
+    else if (ctx >= 1000) tags.push(fmt(ctx / 1000, "K"));
+    else tags.push(`${ctx}`);
+  }
+  return tags;
+}

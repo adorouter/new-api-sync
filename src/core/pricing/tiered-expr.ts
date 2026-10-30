@@ -1,0 +1,109 @@
+/*
+Tiered billing-expression analysis for sync pricing gate.
+
+When upstream serves a model with billing_mode=tiered_expr, model_ratio is a
+placeholder (often 37.5) and would fail canonical-cap checks. This extracts an
+effective model_ratio + completion_ratio from the expression so the gate can
+compare against canonical ratios in the same units.
+
+Units: the expression's `p * X` coefficient X is real USD per million tokens
+(new-api pkg/billingexpr settles exprOutput / 1e6 * QuotaPerUnit), so the input
+ratio is X / 2, the same scale as `model_ratio`.
+
+Strategy: parse all tiers, pick by input coefficient (p). Default picks the
+HIGHEST tier (worst-case upstream cost) so the canonical-cap comparison never
+underestimates what the upstream charges us: a tiered upstream that is cheap on
+short prompts but expensive past 32k must be judged on its expensive tier, or we
+adopt its billing and lose money on long-context calls. Returns the picked
+tier's `p / 2` as effective ratio and `c/p` as completion ratio. Single-tier
+expressions become their direct coefficients.
+
+Returns undefined when the expression is unparseable; caller should fall back
+to the raw placeholder ratio (and likely drop the model).
+*/
+
+const BILLING_PRICING_VAR_KEYS = [
+  "p",
+  "c",
+  "cr",
+  "cc",
+  "cc1h",
+  "img",
+  "img_o",
+  "ai",
+  "ao",
+] as const;
+
+const BILLING_VAR_REGEX = new RegExp(
+  `\\b(${BILLING_PRICING_VAR_KEYS.join("|")})\\s*\\*\\s*([\\d.eE+-]+)`,
+  "g",
+);
+
+type TierCoefficients = Record<string, number>;
+
+function stripExprVersion(exprStr: string): string {
+  if (!exprStr) return "";
+  const m = exprStr.match(/^v(\d+):([\s\S]*)$/);
+  return m && m[2] !== undefined ? m[2] : exprStr;
+}
+
+function parseTierBody(bodyStr: string): TierCoefficients {
+  const coeffs: TierCoefficients = {};
+  const re = new RegExp(BILLING_VAR_REGEX.source, "g");
+  let m;
+  while ((m = re.exec(bodyStr)) !== null) {
+    const key = m[1];
+    const val = m[2];
+    if (key && val !== undefined && !(key in coeffs)) coeffs[key] = Number(val);
+  }
+  return coeffs;
+}
+
+function parseTierCoefficients(exprStr: string): TierCoefficients[] {
+  if (!exprStr) return [];
+  try {
+    const body = stripExprVersion(exprStr);
+    const tierRe = /tier\("[^"]*",\s*([^)]+)\)/g;
+    const tiers: TierCoefficients[] = [];
+    let m;
+    while ((m = tierRe.exec(body)) !== null) {
+      if (m[1] !== undefined) tiers.push(parseTierBody(m[1]));
+    }
+    return tiers;
+  } catch {
+    return [];
+  }
+}
+
+export interface EffectiveTierPricing {
+  modelRatio: number;
+  completionRatio: number;
+  cacheRatio?: number;
+  createCacheRatio?: number;
+}
+
+export function effectiveRatioFromBillingExpr(
+  billingExpr: string,
+  pick: "highest" | "cheapest" = "highest",
+): EffectiveTierPricing | undefined {
+  const tiers = parseTierCoefficients(billingExpr);
+  if (tiers.length === 0) return undefined;
+  type TierWithP = TierCoefficients & { p: number };
+  const withInput = tiers.filter(
+    (t): t is TierWithP => typeof t.p === "number" && t.p > 0,
+  );
+  if (withInput.length === 0) return undefined;
+  const chosen = withInput.reduce((acc, t) =>
+    pick === "highest" ? (t.p > acc.p ? t : acc) : t.p < acc.p ? t : acc,
+  );
+  const completionRatio =
+    typeof chosen.c === "number" ? chosen.c / chosen.p : 1;
+  return {
+    modelRatio: chosen.p / 2,
+    completionRatio,
+    cacheRatio:
+      typeof chosen.cr === "number" ? chosen.cr / chosen.p : undefined,
+    createCacheRatio:
+      typeof chosen.cc === "number" ? chosen.cc / chosen.p : undefined,
+  };
+}

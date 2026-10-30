@@ -1,0 +1,242 @@
+target:
+  baseUrl: https://api.unorouter.com
+  # Upstream new-api: an admin access token (root when option maps are written).
+  # unorouter fork: the scoped sync service token works too.
+  systemAccessToken: target-system-access-token
+  userId: 1
+# Optional: keep logs/verdict-cache.json and the run artifacts in an S3 bucket so
+# every machine that runs the sync (laptop, CI, cluster job) shares one set of
+# verdicts. Any S3 API works (MinIO, R2, Hetzner, AWS). Merged at run start,
+# pushed at run end; an unreachable bucket only logs a warning. Omit for local only.
+# verdictStore:
+#   endpoint: https://s3.example.com
+#   bucket: my-sync
+#   accessKeyId: ${SYNC_S3_ACCESS_KEY}
+#   secretAccessKey: ${SYNC_S3_SECRET_KEY}
+#   prefix: new-api-sync
+#   # openssl rand -hex 32. Seals the OpenRouter key map and the lane key cache
+#   # (logs/lane-keys/<provider>.json.enc locally, lane-keys/<provider>.json.enc
+#   # in the bucket). Without it every run re-reveals every upstream token key,
+#   # which is what cost the a7 walk 94 of its 108 minutes on 2026-09-14.
+#   encryptionKey: ${SYNC_STORE_CIPHER}
+# Read-only DSN of the gateway's postgres for `bun sync reconcile` (our logs are
+# not readable through the scoped service token). Omit to run provider-side
+# checks only. Locally: tsh proxy db newapi-pg --db-user reader --port 15432 --tunnel
+# targetDb:
+#   url: postgres://reader@127.0.0.1:15432/newapi
+# Once the gateway logs to ClickHouse, the HTTP interface with the database as path:
+#   url: http://reader:<password>@127.0.0.1:18123/new_api_logs
+# Public egress addresses of the gateway; upstream rows from any other ip are flagged.
+# targetEgressIps: ["203.0.113.10", "203.0.113.11"]
+blacklist:
+  - kiro
+  - nsfw
+modelMapping:
+  claude-sonnet-4-5-20250929-thinking: claude-sonnet-4-5-20250929
+# Splice upstream GROUP labels before they become channel names. Key = fragment
+# found inside the label (case-insensitive), optionally `provider/fragment`;
+# value replaces just that fragment, the rest of the label is kept. Unscoped
+# rules rename a brand lane on any provider instead of dropping it. The
+# blacklist above runs first on the raw label, so a rule never readmits a
+# blacklisted group. Existing channels are renamed in place by `sync metadata`
+# (preview with `--dry-run`).
+groupMapping:
+  claude code: CC
+  claude-code: CC
+  claude_code: CC
+  claudecode: CC
+  chatgpt: GPT
+  codex: CX
+  gemini cli: GC
+  gemini-cli: GC
+  geminicli: GC
+  antigravity: AG
+  ai studio: AIS
+  ai-studio: AIS
+  aistudio: AIS
+  openclaw: OC
+  droid: DR
+  adobe: AD
+  firefly: FF
+  photoshop: PS
+  github-copilot: GHCP
+  copilot: CP
+  cursor: CU
+  windsurf: WS
+  codeium: CI
+  trae: TR
+  lovable: LV
+  replit: RP
+  manus: MN
+  genspark: GS
+# Per-user, per-model rate limits for the big FREE models that get swarmed.
+# Globs match the published `:free` names only; paid models are never limited.
+# success = successful requests per user per gateway window. Optional total =
+# attempts including failures (absent = unlimited, a failed request never
+# burns the budget).
+rateLimit:
+  models:
+    kimi-*:free: { success: 20 }
+    glm-*:free: { success: 15 }
+    deepseek-*:free: { success: 10 }
+providers:
+  # ── new-api upstream ──
+  - type: newapi
+    name: upstream-main
+    baseUrl: https://www.newapi.ai
+    systemAccessToken: upstream-system-access-token
+    userId: 1
+    enabledModels:
+      - claude-*-4-5*
+      - gpt-5*
+    priceAdjustment: -0.67
+
+  # TypeSafe Jev, a decisions model: serves only POST /v1/decisions, never chat.
+  # Prices are the SELL price per 1M tokens.
+  # - type: typesafe
+  #   name: jev1
+  #   baseUrl: https://decisions.example.invalid
+  #   apiKey: sk-or-v1-...
+  #   models:
+  #     jev-1.13: { upstream: typesafe/jev-1.13, inputPricePerM: 0.084, outputPricePerM: 0, contextWindow: 32000, releaseDate: "2026-09-18" }
+
+  # disabled providers (uncomment to enable)
+  # - type: openrouter
+  #   name: openrouter
+  #   baseUrl: https://router.example.invalid/api
+  #   managementKey: sk-or-v1-...   # mints one capped key per model; apiKey only without it
+  # - type: nvidia
+  #   name: nvidia-nim
+  #   baseUrl: https://nim.example.invalid
+  #   imageBaseUrl: https://nim-images.example.invalid
+  #   apiKey: nvapi-...
+  # Free providers with tight RPM/daily caps set acceptRateLimited so a 429 during
+  # probing keeps the model (capacity throttle, not breakage). It is emitted disabled
+  # and new-api's auto-test re-enables it once the limit clears. Only set this where a
+  # 429 means "quota spent", never "model broken".
+  # Any OpenAI-compatible upstream. Everything that identifies it lives here, never
+  # in code: the URL, the label (channel remark), and how its model list is read.
+  # discovery: path (default /v1/models) or url, authHeader (default Bearer),
+  # headers, listField, idField, idStripPrefix, include/exclude (regex on the id,
+  # ignoreCase), filters (any one must pass: include, exclude, where, whereNot,
+  # free), maxOutputField, pricing, models (static list), modelType,
+  # probeOutputCap, timeoutMs; mode free-groups or task-catalog for the two
+  # catalog shapes that are not a model list.
+  # - type: openai-compatible
+  #   name: free1
+  #   baseUrl: https://free.example.invalid
+  #   apiKey: sk-...
+  #   label: Example Free
+  #   acceptRateLimited: true
+  #   discovery:
+  #     include: ":free$"
+  #     filters:
+  #       - where: { "pricing.free": true }
+  #       - free: { prompt: pricing.prompt, completion: pricing.completion }
+  #     maxOutputField: [max_output_tokens, context_length]
+  #   paramOverride: { operations: [{ path: top_k, mode: delete }] }
+  # Paid relays with a per-minute request cap (80/min here) get perUpstreamRpm:
+  # every probe request to that host (model test, authenticity, verifier) is spaced
+  # so no more than that many start per minute, leaving headroom for live traffic.
+  # acceptRateLimited alone does not help there: a throttled Claude lane is only kept
+  # while its authenticity pass is fresh, so an unpaced run deletes the older ones.
+  # - type: newapi
+  #   name: relay1
+  #   perUpstreamConcurrency: 2
+  #   perUpstreamRpm: 60
+  # authenticityPassTtlHours shortens the 12 hour default for one upstream: a
+  # lane there is re-probed once its last pass is older than this. Keep it under the
+  # gap between full runs so every walk re-probes every lane (the metadata
+  # cron picks up stale a7 lanes every 15 minutes). Marketplaces where merchants
+  # swap backends behind a listing (a7) want a short one.
+  # - type: a7
+  #   name: a7
+  #   authenticityPassTtlHours: 4
+  # Every text lane runs the authenticity ladder, judged against the model's maker.
+  # Only anthropic's findings reject a lane; every other maker is observed (the
+  # finding is logged to logs/observe-<date>.jsonl, the lane passes) until the log
+  # shows how those models answer. Name the rules that stay observe only per maker
+  # id or "*"; an empty list gives that maker's verdicts authority.
+  # authenticity:
+  #   observeOnly:
+  #     deepseek: []
+  #     "*": [foreign, quorum]
+  # The one-word answer battery every ladder run asks (8 cells, temperature 1),
+  # accumulated per lane and judged against the family's trusted profiles before
+  # each store push (notes only). repeats per cell per run (3 = 24 calls),
+  # Jensen-Shannon thresholds in bits and the valid answers a cell needs.
+  #   answerFingerprint:
+  #     repeats: 3
+  #     matchBits: 0.25
+  #     mismatchBits: 0.35
+  #     minCellSamples: 10
+  # acceptUpstreamDown is the same idea one level up, for the channel-shape probe
+  # rather than a single model. A 5xx or a timeout there normally drops every model
+  # behind that bucket for the run; with this set the bucket is kept, its models are
+  # left untested, and the channels are emitted disabled so new-api's scheduled test
+  # brings them back when the host recovers. Set it for a known-good but flaky
+  # upstream; on a retired endpoint it parks dead channels as disabled forever.
+  # - type: newapi
+  #   name: relay1
+  #   baseUrl: https://relay.example.com
+  #   systemAccessToken: ...
+  #   userId: 1
+  #   acceptUpstreamDown: true
+  # Marketplace lanes, one channel per enabled model, priced at profitMultiple
+  # times the most a request can cost there, raised to minSellFraction of list
+  # and cut to maxSellFraction of it (default 1). Every numeric knob takes a
+  # scalar or a glob map with default, first match wins, same as a7. Every URL
+  # lives here, never in code.
+  # ih: a relay with supply pools behind one key, called as
+  # <pool>/<model>. upstreams allowlists pools (flat, or glob-keyed per model);
+  # each lane sends bid headers at the bidQuantile ask of its pool's ladder,
+  # never under the minSellers-th ask (default 3, a thinner pool is skipped).
+  # - type: ih
+  #   name: ih
+  #   apiKey: ...
+  #   baseUrl: https://relay.example.invalid
+  #   catalogUrl: https://relay.example.invalid/api/catalog
+  #   upstreams: { "claude-*": [pool-a], default: [pool-b] }
+  #   enabledModels: [some-model, other-model]
+  #   profitMultiple:
+  #     other-model: 5
+  #     default: 10
+  #   bidQuantile: { other-model: 0.25, default: 0.5 }
+  # si: an order book over resold keys. providers allowlists seller
+  # providers; a lane pins all of them, prices on the minSellers-th cheapest
+  # trusted offer and sets a discount floor (/min{N}) so the dearest seller
+  # it admits still earns 2x.
+  # - type: si
+  #   name: si
+  #   apiKey: ...
+  #   baseUrl: https://market.example.invalid
+  #   providers: [seller-a, seller-b]
+  #   enabledModels: [some-model, other-model]
+  #   profitMultiple: 10
+  #   minSellFraction: { other-model: 0.2 }
+  #   minSellers: { other-model: 5, default: 3 }
+
+# Per-channel-name param_override additions, merged onto whatever the channel
+# already carries. These two a7 pin groups are one merchant (a7 channel 4134,
+# "tokentrans") fronting a Kimi K3 endpoint that 400s ("上游服务暂时不可用") on
+# any temperature other than 1 and on any non-zero frequency or presence
+# penalty, so those fields are dropped and the upstream defaults apply. Other
+# kimi-k3 lanes accept them and stay as is.
+channelParamOverride:
+  - channels:
+      - "a7-chepermodels-3767-kimi-k3"
+      - "a7-tokenmodels-3829-kimi-k3"
+    operations:
+      - { path: temperature, mode: delete }
+      - { path: frequency_penalty, mode: delete }
+      - { path: presence_penalty, mode: delete }
+  # duck's grok rejects reasoning_effort none with invalid-argument; other values
+  # pass, so the field is dropped only when it is exactly none.
+  - channels:
+      - "Grok-Build-duck-grok-4.5"
+      - "Grok-Build-duck-grok-4.6"
+    operations:
+      - path: reasoning_effort
+        mode: delete
+        conditions:
+          - { path: reasoning_effort, mode: full, value: "none" }

@@ -1,0 +1,50 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+_.log
+report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# config with secrets — commit only the example template.
+# The trailing * catches sidecars like config.yml.bak, which hold the same
+# secrets but did not match a pattern anchored at the extension.
+config*.yml*
+config*.yaml*
+!config.example.yml
+!config.example.yaml
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+scripts
+reference
+.secrets/
+logs/observe-*.jsonl
+scratchpad

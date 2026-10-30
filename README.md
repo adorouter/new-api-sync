@@ -1,0 +1,288 @@
+English | [中文](README.zh.md)
+
+> Friends: [LINUX DO](https://linux.do/) - 新的理想型社区
+
+# new-api-sync
+
+Sync pricing, channels, and models from upstream providers to your [new-api](https://github.com/QuantumNous/new-api) instance. Supports [new-api](https://github.com/QuantumNous/new-api), [OpenRouter](https://openrouter.ai/), and [NVIDIA NIM](https://build.nvidia.com/) upstreams.
+
+## Quick Start
+
+First install [Bun](https://bun.com/docs/installation) if you don't have it.
+
+```bash
+bun install
+cp config.example.yml config.yml         # edit with your config
+bun sync run                             # run sync
+bun sync run --only myprovider           # sync one provider
+bun sync run --models "claude-*,gpt-4*"  # sync only matching models
+bun sync run --verbose                   # run with debug logging
+bun sync reset                           # delete all synced data
+```
+
+## Web UI
+
+If you'd rather click than type, launch the bundled dashboard:
+
+```bash
+bun ui                          # shortcut for `bun sync ui`
+bun sync ui --port 4000         # custom port (default 3000)
+```
+
+Then open `http://localhost:3000`. Everything the CLI can do is exposed through the UI, no YAML editing required:
+
+- **Dashboard**: run or reset pipelines live. A streaming log panel shows every provider, model, and price in real time, with colors preserved from the CLI output. Pick which providers to touch (matches `--only`), restrict to specific models with glob wildcards (matches `--models`, e.g. `claude-*, gpt-4*`), and hit **Start**. The models filter persists per config, so switching between configs restores your last selection.
+- **Configuration**: edit every provider, target, blacklist, price adjustment, model mapping, and per-model overrides through structured forms. Invalid YAML is validated before save and rolled back if it fails.
+- **Multiple configs**: create named variants (`debug`, `staging`, `prod`) from the dropdown next to the tabs. Each is stored as `config.<name>.yml` next to the binary (or in the project root in dev mode) and can be switched, duplicated, or deleted without touching the filesystem directly. Cross-config settings (locale, theme, shared blacklist, shared model mapping) live in `config.global.yml`.
+- **History**: browse past runs (`logs/YYYY-MM-DD-*.json`) with per-model pass/fail results, costs, and authenticity status. Authenticity auto-blacklist entries are manageable from the same tab.
+- **Themes & locales**: toggle dark/light/system and switch between English and 中文; both are remembered across sessions.
+
+The UI is bundled as a single-file binary for every platform, so the target machine does not need Bun installed. Grab the right one from `dist/` after `bun run build` (or release artifacts) and run it directly:
+
+```bash
+./new-api-sync-linux-x64 ui      # Linux
+./new-api-sync-darwin-arm64 ui   # macOS (Apple silicon)
+new-api-sync-windows-x64.exe ui  # Windows
+```
+
+## Configuration
+
+Two files are loaded on startup:
+
+- `config.yml` (or a named variant `config.<name>.yml`): the active sync config (target, providers, etc.).
+- `config.global.yml` (optional): cross-config settings. `locale`, `theme`, and UI state are stored here. `blacklist`, `modelMapping` and `groupMapping` defined here merge into every config (global blacklist entries are unioned with per-config; global mappings win on key collisions).
+
+### Target
+
+| Field               | Description                            |
+| ------------------- | -------------------------------------- |
+| `baseUrl`           | Your new-api instance URL              |
+| `systemAccessToken` | System Access Token (Settings > Other) |
+| `userId`            | Your user ID                           |
+| `targetPrefix`      | Optional prefix for sync resources     |
+
+On upstream new-api the token is an admin access token (root for option writes). The unorouter
+fork accepts a scoped sync service token instead; see "Works with upstream new-api" below.
+
+### Global Options
+
+| Field                    | Description                                                                                                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `testModelTypes`         | Model types to test during sync: `["text", "image", "video", "audio", "embedding"]` (default: `["text"]`). Per-provider setting overrides.                                                                               |
+| `skipUnprofitableText`   | Drop text models whose effective ratio >= 1 (default: `true`). See Behaviors to Know.                                                                                                                                    |
+| `globalConcurrency`      | Total simultaneous test/probe HTTP requests across the whole run (default: `50`).                                                                                                                                        |
+| `perUpstreamConcurrency` | Default per-baseUrl request cap (default: `5`). Per-provider override allowed for upstreams that tolerate more or less.                                                                                                  |
+| `blacklist`              | Exclude matching groups/models (text only, case-insensitive). Supports glob wildcards and provider-scoped patterns. See Blacklist below.                                                                                 |
+| `modelMapping`           | Rename models: `{ "claude-sonnet-4-5-20250929-thinking": "claude-sonnet-4-5-20250929" }`                                                                                                                                 |
+| `groupMapping`           | Splice upstream group labels before they become channel names: `{ "antigravity": "AG" }`. See Group label splicing below.                                                                                                |
+| `channelParamOverride`   | Extra `param_override` operations for channels whose name matches a glob, merged onto the override the channel already carries: `[{ channels: ["a7-x-*-kimi-k3"], operations: [{ path: temperature, mode: delete }] }]`. |
+
+### new-api Provider (`type: "newapi"`)
+
+| Field                    | Required | Description                                             |
+| ------------------------ | -------- | ------------------------------------------------------- |
+| `name`                   | yes      | Unique identifier, used as channel tag                  |
+| `baseUrl`                | yes      | Provider URL                                            |
+| `systemAccessToken`      | yes      | System Access Token from provider                       |
+| `userId`                 | yes      | Your user ID on the provider                            |
+| `enabledVendors`         |          | Filter by vendor: `anthropic`, `openai`, `google`, etc. |
+| `enabledModels`          |          | Glob patterns or per-model overrides (see below)        |
+| `testModelTypes`         |          | Override global test types: `["text", "image"]`         |
+| `priceAdjustment`        |          | Number or per-key object (see Price Adjustment below)   |
+| `perUpstreamConcurrency` |          | Override the global per-upstream concurrency cap        |
+
+### OpenAI-compatible Provider (`type: "openai-compatible"`)
+
+Any OpenAI-compatible upstream is a `type: "openai-compatible"` provider. The code holds no URL, name or rule for any of them: `baseUrl` is required, `label` names the channel remark, and a `discovery` block says how the model list is read (path or url, auth header, id field, include/exclude regexes, field filters such as `where: { "pricing.free": true }`, price fields, a static `models` list). See `config.example.yml`. Each model is probed end to end (HTTP, streaming, tool calls, authenticity) before it is published, and models that several providers serve are collapsed into one name with automatic failover between them.
+
+### OpenRouter Provider (`type: "openrouter"`)
+
+Pulls from [OpenRouter](https://openrouter.ai/). Free models (`prompt=0` and `completion=0`) are emitted as a free tier; paid models are bucketed under a per-vendor channel and a single shared `group_ratio` is picked from the candidate ladder `[1, 0.5, 0.25, 0.1, 0.05, 0.01]` such that every kept model stays at or below canonical retail. Models that don't fit at any candidate are dropped.
+
+| Field                    | Required | Description                                                                                          |
+| ------------------------ | -------- | ---------------------------------------------------------------------------------------------------- |
+| `name`                   | yes      | Unique identifier, used as channel tag                                                               |
+| `managementKey`          | one of   | Management key: mints one capped, guardrail-pinned key per model, used for the probe and the channel |
+| `apiKey`                 | one of   | Inference key, only for a provider without a management key (shared by every channel)                |
+| `baseUrl`                | yes      | API root                                                                                             |
+| `models`                 |          | Explicit model IDs (e.g. `moonshotai/kimi-k2.6:free`); skips discovery                               |
+| `enabledVendors`         |          | Filter discovered models by vendor prefix (`anthropic`, `openai`, ...)                               |
+| `enabledModels`          |          | Glob patterns. Bare IDs (no `*`) are also added to the candidate set                                 |
+| `ratio`                  |          | Free-tier group ratio (default `0`)                                                                  |
+| `testModelTypes`         |          | Override global test types                                                                           |
+| `priceAdjustment`        |          | Number or per-key object (see Price Adjustment below)                                                |
+| `perUpstreamConcurrency` |          | Override the global per-upstream concurrency cap                                                     |
+
+### NVIDIA NIM Provider (`type: "nvidia"`)
+
+Pulls from [NVIDIA NIM](https://build.nvidia.com/). Text models are emitted as a free tier; image models are emitted with fixed per-request pricing (`quotaType: 1`) against a separate `imageBaseUrl`.
+
+| Field                    | Required | Description                                                       |
+| ------------------------ | -------- | ----------------------------------------------------------------- |
+| `name`                   | yes      | Unique identifier, used as channel tag                            |
+| `apiKey`                 | yes      | NVIDIA API key                                                    |
+| `baseUrl`                | yes      | Chat API root                                                     |
+| `imageBaseUrl`           | yes      | Image API root                                                    |
+| `models`                 |          | Explicit model IDs; skips auto-discovery                          |
+| `enabledVendors`         |          | Filter by inferred vendor                                         |
+| `enabledModels`          |          | Glob patterns. Bare image-model IDs (no `*`) are added to the set |
+| `ratio`                  |          | Text-tier group ratio (default `1`)                               |
+| `testModelTypes`         |          | Override global test types                                        |
+| `priceAdjustment`        |          | Number or per-key object (see Price Adjustment below)             |
+| `perUpstreamConcurrency` |          | Override the global per-upstream concurrency cap                  |
+
+### Blacklist
+
+`blacklist` removes matching text models from sync. Non-text types (image, video, audio, embedding) are never filtered by the blacklist.
+
+- **Case-insensitive** match against the model ID.
+- **Glob wildcards** supported: `gpt-5.*-codex`, `*-preview`.
+- **Provider-scoped patterns** use `provider/pattern` syntax. The part before the slash must match the provider's `name`; the part after is the glob. Example:
+
+  ```yml
+  blacklist:
+    - nsfw # unscoped: blocks any provider's model containing "nsfw"
+    - "*-preview" # unscoped: blocks any provider's preview models
+    - duck/gpt-5* # scoped: only blocks gpt-5* models from the "duck" provider
+    - yun/claude-*-opus # scoped: only blocks claude opus models from "yun"
+  ```
+
+A small built-in blacklist is always merged in to suppress a handful of upstream IDs that are uniformly broken or mis-typed (embedding/audio/video models served as `text`). You don't need to add these in your config.
+
+### Group label splicing
+
+`groupMapping` rewrites a fragment of an upstream group label before the label becomes a channel and group name (`<label>-<provider>-<model>`). The lane, its pricing and its upstream token are untouched; only the public name changes.
+
+- **Key** is the fragment to find inside the label, matched case-insensitively. `provider/fragment` limits the rule to one provider.
+- **Value** replaces just that fragment. The rest of the label survives, so `duck/Antigravity: pool-a` turns `Gemini-CLI-Antigravity` into `Gemini-CLI-pool-a`.
+- Scoped rules run before bare ones, longer fragments before shorter; each rule runs once.
+- The blacklist runs first, on the raw label and description; a rule never readmits a blacklisted group. To rename a brand lane instead of dropping it, keep the brand word out of the blacklist and add an unscoped rule for it.
+- **Existing channels are renamed in place**: `sync metadata` (and the start of `sync run`) finds channels whose remark still carries the pre-rule label, moves their `GroupRatio` / `UserUsableGroups` / `AutoGroups` keys to the new name, and renames the channel row. Channel ids and stats are kept; nothing is created or deleted. Preview with `sync metadata --dry-run`.
+- A rename whose target name already exists is skipped and logged as a collision.
+
+  ```yml
+  groupMapping:
+    antigravity: AG # any provider: Gemini-CLI-Antigravity -> Gemini-CLI-AG
+    pol/adobe: AD # only pol: image2c-adobe -> image2c-AD
+  ```
+
+### Price Adjustment
+
+`priceAdjustment` accepts either a single number or a keyed object:
+
+- **Number:** applies uniformly. Must be in the open range `(-1, 1)`. `-0.5` = 50% cheaper, `0.1` = 10% more expensive.
+- **Object:** keyed by model name glob, vendor name, model type, or `default`. Resolved in that order. Must contain a `default` key. Numeric keys for non-text types may go up to `1`; text-type keys (vendors, model globs that resolve to text, and `default`) must stay below `1` so the resulting channel never costs more than calling the upstream directly. Example:
+
+  ```yml
+  priceAdjustment:
+    default: -0.3
+    image: 0.5
+    anthropic: -0.1
+    gpt-5*: -0.5
+  ```
+
+### Per-Model Overrides via `enabledModels`
+
+`enabledModels` accepts string globs or objects keyed by `model`:
+
+```yml
+enabledModels:
+  - "claude-*-4-5*" # plain glob
+  - model: "gpt-5"
+    metadata:
+      maxOutputTokens: 32768
+      isReasoning: true
+  - type: "image"
+    model: "flux-pro"
+    modelPricingGrid:
+      - { "size": "1024x1024", "price": 0.04 }
+      - { "size": "2048x2048", "price": 0.08 }
+```
+
+- `metadata` is forwarded to new-api's per-model `metadata` JSON column (consumed by client UIs to drive per-model behaviors like bumping `max_tokens` for reasoning models).
+- `modelPricingGrid` defines fixed per-request pricing tables for image/video/audio models.
+
+## How It Works
+
+1. **Discover**: fetch models/groups from each provider, filter by vendor, blacklist, and glob patterns; splice group labels per `groupMapping`
+2. **Test**: verify each model with a minimal API request
+3. **Build desired state**: merge pricing (GroupRatio, ModelRatio, CompletionRatio), build channels and policy
+4. **Diff**: compare desired state against current target state
+5. **Apply**: create, update, and delete channels, models, and options
+6. **Cleanup**: remove orphaned models
+
+Channels are named `{group}-{provider}`. When a provider's models split into multiple price tiers, channels get numeric suffixes: `{group}-{provider}-t0`, `-t1`, etc. Sub-splits (caused by per-model price overrides or task model pins) add a letter: `-t0a`, `-t0b`. Priority is dynamic: cheapest groups first, faster response times get higher priority.
+
+## Shared verdict store (optional)
+
+Every probe outcome lands in `logs/verdict-cache.json`. With several machines running the sync
+(a laptop, a CI job, a cluster CronJob) that file drifts, so `verdictStore` in `config.yml` names
+an S3 bucket (any S3 API: MinIO, R2, Hetzner, AWS) that holds one shared copy:
+
+```yaml
+verdictStore:
+  endpoint: https://s3.example.com
+  bucket: my-sync
+  accessKeyId: ${SYNC_S3_ACCESS_KEY}
+  secretAccessKey: ${SYNC_S3_SECRET_KEY}
+  prefix: new-api-sync
+```
+
+A run merges the object into the local file at start (union by key, newest verdict wins, a
+recorded authenticity failure always survives) and pushes the merged result at the end; the
+model-test reports and apply-error logs are mirrored under `artifacts/`. An unreachable bucket
+only logs a warning and the run continues on the local file. Passing verdicts expire on their
+own (functional probes after 7 days with a per-lane jitter, Claude authenticity after 3), so
+lanes are retested without anyone pruning the file. Leave `verdictStore` out for a local-only
+setup, which is the default.
+
+## Works with upstream new-api
+
+The sync targets upstream [new-api](https://github.com/QuantumNous/new-api) as well as the
+unorouter fork. On first use it probes one fork-only route and, on a vanilla gateway, logs
+`vanilla new-api (no sync routes)` once and adapts:
+
+| Feature                        | Fork                                | Upstream new-api                                                              |
+| ------------------------------ | ----------------------------------- | ----------------------------------------------------------------------------- |
+| Auth                           | scoped sync token or admin token    | admin access token (root for `/api/option/`)                                  |
+| Model list                     | `GET /api/models/list`              | `GET /api/models/`                                                            |
+| Orphaned-model cleanup         | `DELETE /api/models/orphaned`       | skipped                                                                       |
+| Guest token model limits       | `PUT /api/token/guest-model-limits` | standard token update (token must belong to the access token's user)          |
+| Model metadata (context, tags) | `models.metadata` column            | no column upstream; description, tags, vendor and endpoints are still written |
+
+Everything else (channels, vendors, option maps, ability rebuild, tokens) uses routes both have.
+
+## Behaviors to Know
+
+### Unprofitable Text Models Are Skipped (default on)
+
+By default, text models whose effective ratio (group ratio x `priceAdjustment`) is >= 1.0 are skipped so sync never creates channels more expensive than calling the upstream directly. Non-text types (image, video, audio, embedding) are unaffected.
+
+Disable via global config:
+
+```yml
+skipUnprofitableText: false
+```
+
+### Hard Pricing Cap
+
+In addition to the unprofitable-text gate, every offer that would charge a user more than the canonical retail ratio (resolved from LiteLLM, then OpenRouter, then basellm) is dropped before sync. There is no user-facing knob for this cap; it is always 1x of canonical retail. This applies to OpenRouter paid offers.
+
+### Task Model Channel Pinning
+
+Certain video/image models are pinned to specific channel types in new-api: `sora`, `kling`, `vidu`, `jimeng`, `hailuo`, `seedance`, `veo`, `imagen`, `wan`. Some also append a path suffix to the provider's `baseUrl` (e.g., `wan` becomes `/alibailian`). This happens automatically and produces a separate sub-channel.
+
+### Model Metadata Enrichment
+
+During sync, model descriptions and tags are fetched from two public feeds to enrich the metadata shown in new-api:
+
+- [OpenRouter `/api/v1/models`](https://openrouter.ai/api/v1/models): descriptions (preferred)
+- [basellm `llm-metadata`](https://basellm.github.io/llm-metadata/api/newapi/models.json): descriptions (fallback) and tags
+
+These calls are best-effort: failures are logged as warnings and do not block the sync. Fuzzy name matching handles version/date-suffix variants (`claude-sonnet-4-5-20250929` resolves to `claude-sonnet-4.5`).
+
+### Authenticity Auto-Blacklist
+
+`logs/authenticity-blacklist.json` is maintained automatically by the test runner to track Anthropic Claude models from providers that failed authenticity checks. This is internal state, but entries can be reviewed and removed from the History tab in the UI.
+
+<!-- bun sync run --only nvda1,open1,open2 -->

@@ -1,0 +1,108 @@
+// Output types for the pricing pipeline.
+//
+// A PricedPlan is the result of compute(): a list of fully-priced tiers ready
+// for emission as channels, plus the global model_ratios map and a list of
+// drops for diagnostics. Once you have a PricedPlan, no more pricing math
+// happens — emit() just translates tiers into Channel objects.
+
+import type { Channel, MergedGroup, MergedModel } from "@core/types";
+import type { ModelTestDetail } from "@core/testing/types";
+
+export interface PricedTier {
+  /** Disambiguated channel name, e.g. `aigc-3-moonshot-t1`. Already includes
+   *  the `-tN` / `-tNa` suffixes when there are multiple tiers / sub-tiers. */
+  channelName: string;
+  vendor: string;
+  channelType: number;
+  /** Final base URL (provider baseUrl + optional task-override suffix). */
+  baseUrl: string;
+  apiKey: string;
+  /** Provider tag (channel.tag) — used to identify the owning provider for
+   *  managedProviders set membership. */
+  providerTag: string;
+  channelRemark: string;
+  /** Final post-rescale, post-adjustment group ratio. This is what gets
+   *  written to GroupRatio for this tier. */
+  groupRatio: number;
+  groupDescription: string;
+  /** Exposed model names that should be served by this channel. */
+  models: string[];
+  /** Reverse mapping (exposed -> upstream) scoped to this tier's models. */
+  modelMapping?: Record<string, string>;
+  /** Test details pre-filtered to this tier's models. emit() reads these to
+   *  build the capabilities JSON for channel.setting. */
+  testDetails?: ModelTestDetail[];
+  /** Optional channel-scoped param_override JSON. Used for header injection
+   *  on conditional model-name suffixes (e.g. Claude `[1m]` context beta). */
+  paramOverride?: string;
+  /** channel.header_override JSON: upstream headers stamped per request,
+   *  e.g. {"X-Uno-User": "{user_id}"} for upstreams that keep per-caller state. */
+  headerOverride?: string;
+  /** Emit the channel disabled (status=3). Set when the model only passed via a
+   *  429 capacity throttle; new-api's auto-test enables it once the limit clears. */
+  disabled?: boolean;
+  /** Forward the raw client body to upstream (channel.setting.pass_through_body_enabled).
+   *  Media channels need it so non-struct fields (image_urls, vendor extras) survive new-api's
+   *  ImageRequest re-marshal, which drops unknown fields. */
+  passThroughBody?: boolean;
+  /** Upgrade client stream=false to upstream SSE for this channel; the gateway
+   *  aggregates it back to one JSON body. Dodges reseller edge header timeouts. */
+  forceUpstreamStream?: boolean;
+  /** Gateway-side caps for the lane (channel.setting.max_concurrency / max_rps):
+   *  a saturated lane is skipped instead of asked, so an upstream with a small
+   *  documented budget stops answering 429 to everyone. */
+  channelLimits?: { maxConcurrency?: number; maxRps?: number };
+  /** Bill each request at the upstream's reported cost times this, when that is
+   *  more than the lane's token price (channel.setting.upstream_cost_markup). For
+   *  marketplaces whose seller, and so whose real cost, changes per request. */
+  upstreamCostMarkup?: number;
+  /** Scheduled-test cadence in minutes (channel.setting.auto_test_interval_minutes).
+   *  Set for exit-IP-metered lanes, where each probe spends part of a small per-IP
+   *  request budget that real traffic needs. */
+  autoTestIntervalMinutes?: number;
+  /** Upper bound of the scheduled-test window. Above autoTestIntervalMinutes the
+   *  gateway spreads sibling channels across [min,max] by channel id instead of
+   *  letting them all come due in the same cycle. */
+  autoTestIntervalMaxMinutes?: number;
+  /** Channel-level system prompt (channel.setting.system_prompt) injected on every
+   *  request. Lifts CN-model soft refusals. */
+  systemPrompt?: string;
+  /** When true, prepend systemPrompt to a user-supplied system message; when false,
+   *  inject only if the request has none (channel.setting.system_prompt_override). */
+  systemPromptOverride?: boolean;
+  /** Intentional same-model failover channel (e.g. an OpenRouter pricier upstream
+   *  host pinned via provider.only). Exempt from the cross-provider dedup drop in
+   *  capAbove1x so it survives as a redundancy lane at its own group ratio. */
+  failoverDuplicate?: boolean;
+}
+
+type PricedDropReason = "cap-exceeded" | "no-fit" | "collision";
+
+export interface PricedDrop {
+  model: string;
+  /** Intended tier name where the model would have landed. */
+  channel: string;
+  reason: PricedDropReason;
+  effectiveRatio?: number;
+  /** Optional human-readable detail for log lines. */
+  detail?: string;
+}
+
+export interface PricedPlan {
+  tiers: PricedTier[];
+  /** Single source of truth for model_ratio + completion/cache ratios.
+   *  Built by compute() from canonical retail (LiteLLM > OpenRouter >
+   *  basellm) when available, falling back to cheapest offer ratio when
+   *  no canonical resolves. */
+  modelRatios: Map<string, MergedModel>;
+  drops: PricedDrop[];
+}
+
+/** Inputs to compute() that come from the existing target snapshot or
+ *  partial-sync seeding. Must include any baseline channels/groups whose
+ *  ratios the "cheapest existing" lookup needs to consider. */
+export interface BaselineInputs {
+  groups: MergedGroup[];
+  channels: Channel[];
+  modelRatios: Map<string, MergedModel>;
+}
