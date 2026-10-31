@@ -1,3 +1,5 @@
+> AdoRouter modified this software. It is based on [new-api-sync](https://github.com/unorouter/new-api-sync), under the MIT licence.
+
 English | [中文](README.zh.md)
 
 > Friends: [LINUX DO](https://linux.do/) - 新的理想型社区
