@@ -1,9 +1,3 @@
-> AdoRouter modified this software. It is based on [new-api-sync](https://github.com/unorouter/new-api-sync), under the MIT licence.
-
-English | [中文](README.zh.md)
-
-> Friends: [LINUX DO](https://linux.do/) - 新的理想型社区
-
 # new-api-sync
 
 Sync pricing, channels, and models from upstream providers to your [new-api](https://github.com/QuantumNous/new-api) instance. Supports [new-api](https://github.com/QuantumNous/new-api), [OpenRouter](https://openrouter.ai/), and [NVIDIA NIM](https://build.nvidia.com/) upstreams.
