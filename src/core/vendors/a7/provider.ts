@@ -29,7 +29,6 @@ import {
   fetchMarketplaceModelNames,
   resolveMarketplaceModels,
   selectMerchants,
-  supplierSlug,
   usdPerMillion,
   type Listing,
 } from "./marketplace";
@@ -672,10 +671,10 @@ function buildLaneOffer(
     canonicalListUsd,
   );
 
-  const slug = supplierSlug(lane.listing.supplier_name);
-  const laneId = slug
-    ? `${slug}-${lane.listing.channel_id}`
-    : `${lane.listing.channel_id}`;
+  // AdoRouter: lanes are named <provider>-<listing id>-<model>, for example
+  // m1-1234-gemini-4-argon. Group and channel names are public, so the
+  // merchant's name stays out of them; the channel remark keeps it for admins.
+  const laneId = `${lane.listing.channel_id}`;
   const vendor = inferVendorFromModelName(lane.model) ?? "unknown";
   return {
     provider: name,
