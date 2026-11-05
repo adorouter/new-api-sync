@@ -218,9 +218,19 @@ export function selectMerchants(
   // so a seller type can be banned without banning the model it sells. Only
   // scoped entries apply here: global entries are model-name fences and free
   // text would false-positive against them.
-  const scoped = (blacklist ?? []).filter((e) =>
-    e.toLowerCase().startsWith(`${provider.name.toLowerCase()}/`),
-  );
+  const prefix = `${provider.name.toLowerCase()}/`;
+  // AdoRouter: a text entry may carry a model glob too, `m1/*kiro*/claude-*`,
+  // which fences merchants whose metadata matches only for those models. It is
+  // rewritten to the plain text form when the model matches and dropped when it
+  // does not, so matchesBlacklist below never sees the glob.
+  const scoped = (blacklist ?? []).flatMap((e) => {
+    if (!e.toLowerCase().startsWith(prefix)) return [];
+    const [text, glob] = e.slice(prefix.length).split("/", 2);
+    if (!text || /^\d+$/.test(text) || glob === undefined) return [e];
+    return matchesAnyPattern(model, [glob])
+      ? [`${provider.name}/${text}`]
+      : [];
+  });
   // a7/<merchant>/<model glob> fences one lane; a bare a7/<merchant> every model
   // it sells. A name entry would take every merchant of that supplier.
   const blockedIds = new Set(
