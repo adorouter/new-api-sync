@@ -57,6 +57,7 @@ program
     [] as string[],
   )
   .option("--dry-run", t("CLI.OPTION.DRY_RUN"))
+  .option("--preview", t("CLI.OPTION.PREVIEW"))
   .option("-v, --verbose", t("CLI.OPTION.VERBOSE"))
   .action(
     async (options: {
@@ -65,6 +66,7 @@ program
       models: string[];
       type: string[];
       dryRun?: boolean;
+      preview?: boolean;
       verbose?: boolean;
     }) => {
       if (options.verbose) consola.level = 4;
@@ -75,7 +77,10 @@ program
         ),
         options.type,
       );
-      const result = await runSync(config, { dryRun: options.dryRun });
+      const result = await runSync(config, {
+        dryRun: options.dryRun,
+        preview: options.preview,
+      });
       printRunSummary(result);
 
       if (!result.success) {

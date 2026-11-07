@@ -265,6 +265,7 @@
       "VERBOSE": "enable debug logging",
       "PORT": "port to listen on",
       "DRY_RUN": "preview pricing + diff without probing, testing, creating tokens, or writing to the target (no cost; logs still saved)",
+      "PREVIEW": "like --dry-run upstream (no probes, tests or tokens, no cost), but writes the lanes to the target with a placeholder key; they fail every request until a real run, so remove them first with reset --only",
       "METADATA_DRY_RUN": "preview the group label renames the current groupMapping would apply to existing channels; writes nothing",
       "BALANCE_JSON": "print the result as JSON instead of a table",
       "SINCE": "window to reconcile, e.g. 30m, 6h, 24h, 3d",

@@ -131,9 +131,22 @@ async function snapshot(
 
 export async function runSync(
   config: RuntimeConfig,
-  opts?: { dryRun?: boolean },
+  opts?: { dryRun?: boolean; preview?: boolean },
 ): Promise<SyncRunResult> {
   const start = Date.now();
+  // AdoRouter: preview = the upstream side of a dry run (no tokens, pins,
+  // probes or balance reads, so it costs nothing) applied to the target with a
+  // placeholder key, so the lanes show on the site before the upstream account
+  // is funded. They cannot serve a request: every call to them fails until a
+  // real run. Remove them first (`reset --only <provider>`), because a real run
+  // keeps a lane's status and the gateway disables failing lanes.
+  const preview = opts?.preview ?? false;
+  if (preview && opts?.dryRun)
+    throw new Error("--preview and --dry-run cannot be combined");
+  if (preview)
+    consola.warn(
+      "preview: lanes are written with a placeholder key and fail every request until a real run",
+    );
   acquireSyncLock();
   timingReset();
   const dryRun = opts?.dryRun ?? false;
@@ -181,7 +194,7 @@ export async function runSync(
       config,
       snap,
       {
-        dryRun,
+        dryRun: dryRun || preview,
       },
     );
     timingMark("discover+price");

@@ -102,8 +102,13 @@ export async function ensureLaneTokens(
 ): Promise<Map<string, LaneToken>> {
   const result = new Map<string, LaneToken>();
   if (opts.dryRun) {
+    // A placeholder rather than "": a --preview run writes these lanes to a
+    // local gateway, which refuses a channel without a key.
     for (const lane of lanes)
-      result.set(laneTokenName(lane), { key: "", tokenId: 0 });
+      result.set(laneTokenName(lane), {
+        key: "preview-placeholder-not-a-key",
+        tokenId: 0,
+      });
     return result;
   }
 
