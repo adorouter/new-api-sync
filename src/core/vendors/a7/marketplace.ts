@@ -16,6 +16,8 @@ import pLimit from "p-limit";
 export interface Listing {
   channel_id: number;
   listing_id: number;
+  // AdoRouter: one supplier runs several channels; supplier-strikes.ts bans by it.
+  supplier_id?: number;
   supplier_name: string;
   channel_name: string;
   description: string;
@@ -227,9 +229,7 @@ export function selectMerchants(
     if (!e.toLowerCase().startsWith(prefix)) return [];
     const [text, glob] = e.slice(prefix.length).split("/", 2);
     if (!text || /^\d+$/.test(text) || glob === undefined) return [e];
-    return matchesAnyPattern(model, [glob])
-      ? [`${provider.name}/${text}`]
-      : [];
+    return matchesAnyPattern(model, [glob]) ? [`${provider.name}/${text}`] : [];
   });
   // a7/<merchant>/<model glob> fences one lane; a bare a7/<merchant> every model
   // it sells. A name entry would take every merchant of that supplier.

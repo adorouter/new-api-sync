@@ -21,6 +21,7 @@ import { inferVendorFromModelName } from "@core/catalog/constants/vendor-matcher
 import { consola } from "consola";
 import pLimit from "p-limit";
 import { t } from "@server/i18n";
+import { SupplierStrikes, supplierKeyOf } from "./supplier-strikes";
 import {
   DEFAULT_MAX_SELL_FRACTION,
   DEFAULT_PROFIT_MULTIPLE,
@@ -218,9 +219,15 @@ function collectCandidates(
   config: RuntimeConfig,
   ctx: ProviderRunContext,
   byModel: Map<string, Listing[]>,
-): { models: ModelCandidates[]; skippedModels: string[] } {
+  strikes: SupplierStrikes,
+): {
+  models: ModelCandidates[];
+  skippedModels: string[];
+  struckCandidates: number;
+} {
   const models: ModelCandidates[] = [];
   const skippedModels: string[] = [];
+  let struckCandidates = 0;
 
   // Every key of byModel already passed the blacklist, enabled and --models
   // cuts in resolveMarketplaceModels.
@@ -230,13 +237,15 @@ function collectCandidates(
     const canonicalListUsd = canonicalListUsdFor(model, config, ctx);
 
     const wanted = resolvePerModel(provider.hostsPerModel, model, 1);
-    const candidates = selectMerchants(
+    const viable = selectMerchants(
       model,
       rows,
       provider,
       canonicalListUsd,
       config.blacklist,
     );
+    const candidates = viable.filter((l) => !strikes.isStruck(l));
+    struckCandidates += viable.length - candidates.length;
     if (candidates.length === 0) {
       skippedModels.push(model);
       continue;
@@ -260,6 +269,7 @@ function collectCandidates(
   return {
     models: models.filter((mc) => mc.candidates.length > 0),
     skippedModels,
+    struckCandidates,
   };
 }
 
@@ -324,15 +334,21 @@ export async function processA7Provider(
         `[${name}] ${unreachable.length} model(s) unreachable at the marketplace this run, their lanes are kept: ${unreachable.join(", ")}`,
       );
 
-    const { models, skippedModels } = collectCandidates(
+    // Fresh severe fails already in the verdict cache strike their supplier
+    // before the walk, so its other channels are never keyed or probed.
+    const strikes = new SupplierStrikes(name);
+    for (const [model, rows] of byModel)
+      for (const row of rows) strikes.noteVerdict(row, model);
+    const { models, skippedModels, struckCandidates } = collectCandidates(
       provider,
       config,
       ctx,
       byModel,
+      strikes,
     );
     const candidateTotal = models.reduce((n, m) => n + m.candidates.length, 0);
     consola.info(
-      `[${name}] ${models.length} model(s), ${candidateTotal} candidate merchant(s), ${skippedModels.length} model(s) without a qualifying merchant`,
+      `[${name}] ${models.length} model(s), ${candidateTotal} candidate merchant(s), ${skippedModels.length} model(s) without a qualifying merchant, ${struckCandidates} listing(s) of struck suppliers skipped`,
     );
     if (models.length === 0) {
       report.error = "no model had a merchant meeting the price/health rules";
@@ -416,11 +432,17 @@ export async function processA7Provider(
       let idx = 0;
       let probed = 0;
       while (serving < mc.wanted && idx < mc.candidates.length) {
-        const take = Math.min(mc.wanted - serving, mc.candidates.length - idx);
-        const batch: MerchantLane[] = mc.candidates
-          .slice(idx, idx + take)
-          .map((listing) => ({ model: mc.model, listing }));
-        idx += take;
+        // A supplier struck on another model since the walk began is passed over.
+        const batch: MerchantLane[] = [];
+        while (
+          batch.length < mc.wanted - serving &&
+          idx < mc.candidates.length
+        ) {
+          const listing = mc.candidates[idx++]!;
+          if (!strikes.isStruck(listing))
+            batch.push({ model: mc.model, listing });
+        }
+        if (batch.length === 0) break;
         consola.info(
           `[${name}] ${mc.model}: keying ${batch.length} lane(s) (${batch.map((l) => l.listing.channel_id).join(", ")})`,
         );
@@ -518,7 +540,13 @@ export async function processA7Provider(
           }),
         );
         for (const { probe, verdict } of verdicts) {
-          if (verdict.workingModels.length === 0) continue;
+          if (verdict.workingModels.length === 0) {
+            if (strikes.noteVerdict(probe.lane.listing, probe.lane.model))
+              consola.warn(
+                `[${name}] supplier ${supplierKeyOf(probe.lane.listing)} struck on ${probe.lane.model} (#${probe.lane.listing.channel_id}): its other channels are dropped from this run`,
+              );
+            continue;
+          }
           kept.push({
             lane: probe.lane,
             key: probe.key,
@@ -537,7 +565,34 @@ export async function processA7Provider(
       consola.info(
         `[${name}] ${mc.model} done: ${kept.length} lane(s) in ${Math.round((Date.now() - modelStart) / 1000)}s, ${models.length - modelIdx} model(s) left`,
       );
-      if (kept.length === 0) return;
+      if (kept.length > 0) keptByModel.push({ mc, kept });
+    };
+    // Models walk side by side; every probe still passes the per-upstream gate,
+    // so the load on a7 stays capped while one slow merchant no longer idles the rest.
+    const keptByModel: {
+      mc: (typeof models)[number];
+      kept: { lane: MerchantLane; key: string; rateLimited: boolean }[];
+    }[] = [];
+    const walkLimit = pLimit(A7_MODEL_PARALLEL);
+    await Promise.all(
+      models.map((mc, i) => walkLimit(() => walkModel(mc, i + 1))),
+    );
+
+    // A supplier struck on a later model loses the lanes it passed earlier in
+    // the walk too. Offers are built only now, from what is left.
+    let struckLanes = 0;
+    for (const { mc, kept: all } of keptByModel) {
+      const kept = all.filter((k) => !strikes.isStruck(k.lane.listing));
+      for (const k of all)
+        if (strikes.isStruck(k.lane.listing))
+          consola.warn(
+            `[${name}] ${k.lane.model}: dropped #${k.lane.listing.channel_id}, supplier ${supplierKeyOf(k.lane.listing)} struck on ${strikes
+              .strikesFor(k.lane.listing)
+              .map((s) => s.model)
+              .join(", ")}`,
+          );
+      struckLanes += all.length - kept.length;
+      if (kept.length === 0) continue;
       keptLanes.push(...kept.map((k) => k.lane));
 
       // Cheapest KEPT lane per model gets the plain channel; the rest are
@@ -558,13 +613,12 @@ export async function processA7Provider(
             mc.canonicalListUsd,
           ),
         );
-    };
-    // Models walk side by side; every probe still passes the per-upstream gate,
-    // so the load on a7 stays capped while one slow merchant no longer idles the rest.
-    const walkLimit = pLimit(A7_MODEL_PARALLEL);
-    await Promise.all(
-      models.map((mc, i) => walkLimit(() => walkModel(mc, i + 1))),
+    }
+    const newStrikes = strikes.newStrikes();
+    consola.info(
+      `[${name}] supplier strikes: ${newStrikes.length} new, ${struckLanes} passing lane(s) dropped`,
     );
+    if (!dryRun && newStrikes.length > 0) strikes.save();
     if (deferredAt.length > 0) {
       const deferred = deferredAt
         .sort((a, b) => a - b)
