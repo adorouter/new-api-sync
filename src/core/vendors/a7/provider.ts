@@ -347,7 +347,10 @@ export async function processA7Provider(
 
     // Fresh severe fails already in the verdict cache strike their supplier
     // before the walk, so its other channels are never keyed or probed.
-    const strikes = new SupplierStrikes(name);
+    const strikes = new SupplierStrikes(
+      name,
+      provider.banStruckSuppliers === true,
+    );
     for (const [model, rows] of byModel)
       for (const row of rows) strikes.noteVerdict(row, model);
     const { models, skippedModels, struckCandidates } = collectCandidates(
@@ -626,9 +629,10 @@ export async function processA7Provider(
         );
     }
     const newStrikes = strikes.newStrikes();
-    consola.info(
-      `[${name}] supplier strikes: ${newStrikes.length} new, ${struckLanes} passing lane(s) dropped`,
-    );
+    if (strikes.enabled)
+      consola.info(
+        `[${name}] supplier strikes: ${newStrikes.length} new, ${struckLanes} passing lane(s) dropped`,
+      );
     if (!dryRun && newStrikes.length > 0) strikes.save();
     if (deferredAt.length > 0) {
       const deferred = deferredAt

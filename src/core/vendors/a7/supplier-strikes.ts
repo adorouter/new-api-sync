@@ -77,9 +77,17 @@ export class SupplierStrikes {
   private readonly ledger: Ledger;
   private readonly added: { key: string; strike: SupplierStrike }[] = [];
 
-  constructor(private readonly provider: string) {
-    const raw = readJson<Ledger>(ledgerPath(provider)) ?? {};
+  // Off unless the provider sets banStruckSuppliers (off since 2026-11-08: a
+  // supplier faking one model may sell others honestly, and the first run with
+  // it on dropped almost half the catalogue). Off, the ledger is neither read
+  // nor written, so the walk judges every lane on its own verdict again.
+  constructor(
+    private readonly provider: string,
+    readonly enabled: boolean,
+  ) {
     this.ledger = {};
+    if (!enabled) return;
+    const raw = readJson<Ledger>(ledgerPath(provider)) ?? {};
     for (const [key, strikes] of Object.entries(raw)) {
       const kept = (strikes ?? []).filter(fresh);
       if (kept.length > 0) this.ledger[key] = kept;
@@ -99,6 +107,7 @@ export class SupplierStrikes {
    * severe reason. Returns true when this call struck a supplier that was clean.
    */
   noteVerdict(listing: Listing, model: string): boolean {
+    if (!this.enabled) return false;
     const entry = getVerdict(`${this.provider}:${listing.channel_id}|${model}`);
     if (!entry || !isAuthenticityFailFresh(entry)) return false;
     const reason = entry.authenticityReason ?? "";
@@ -127,6 +136,7 @@ export class SupplierStrikes {
   }
 
   save(): void {
+    if (!this.enabled) return;
     writeJsonAtomic(ledgerPath(this.provider), this.ledger, { pretty: true });
   }
 }
