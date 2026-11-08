@@ -358,6 +358,15 @@ interface PriceNoticesResponse {
 // from `sync metadata` so the cadence is the cron's, not the full-sync's.
 export async function acceptPriceNotices(
   provider: A7ProviderConfig,
+  opts: {
+    // AdoRouter: a reason to leave the pin paused, or undefined to accept.
+    // `price-notices` checks the new cost against what the lane sells for.
+    guard?: (notice: {
+      channelId: number;
+      model: string;
+      newOutMicros: number | undefined;
+    }) => string | undefined;
+  } = {},
 ): Promise<{ accepted: number; leftPaused: number }> {
   const result = { accepted: 0, leftPaused: 0 };
   const base = provider.baseUrl.replace(/\/$/, "");
@@ -426,6 +435,18 @@ export async function acceptPriceNotices(
       ) {
         consola.warn(
           `[${provider.name}] leaving pin paused for ${notice.model_name} -> ${notice.channel_id}: new price breaches the sell ceiling`,
+        );
+        result.leftPaused++;
+        continue;
+      }
+      const held = opts.guard?.({
+        channelId: notice.channel_id,
+        model: notice.model_name,
+        newOutMicros: newOut,
+      });
+      if (held) {
+        consola.warn(
+          `[${provider.name}] leaving pin paused for ${notice.model_name} -> ${notice.channel_id}: ${held}`,
         );
         result.leftPaused++;
         continue;

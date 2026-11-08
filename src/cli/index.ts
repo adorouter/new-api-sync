@@ -15,6 +15,7 @@ import {
   rollupLaneReport,
 } from "@core/quality/lane-report";
 import { printMetadataSummary, runMetadataSync } from "@core/sync/metadata";
+import { runPriceNotices } from "@core/sync/price-notices";
 import { runReset } from "@core/sync/reset";
 import { printResetSummary, printRunSummary, runSync } from "@core/sync/run";
 import {
@@ -146,6 +147,30 @@ program
       printMetadataSummary(result);
       if (result.failed > 0 || result.optionErrors.length > 0)
         process.exitCode = 1;
+    },
+  );
+
+// AdoRouter: accept marketplace price changes on a timer, with no probes. See
+// core/sync/price-notices.ts.
+program
+  .command("price-notices")
+  .description(t("CLI.COMMAND.PRICE_NOTICES_DESC"))
+  .option("-c, --config <path>", t("CLI.OPTION.CONFIG_PATH"))
+  .option(
+    "--only <providers>",
+    t("CLI.OPTION.ONLY_PROVIDERS"),
+    (value: string, prev: string[]) => [...prev, value],
+    [] as string[],
+  )
+  .option("-v, --verbose", t("CLI.OPTION.VERBOSE"))
+  .action(
+    async (options: { config?: string; only: string[]; verbose?: boolean }) => {
+      if (options.verbose) consola.level = 4;
+      const config = applyOnlyProviders(
+        await loadConfig(options.config),
+        options.only,
+      );
+      await runPriceNotices(config);
     },
   );
 
