@@ -18,6 +18,9 @@ export interface Listing {
   listing_id: number;
   // AdoRouter: one supplier runs several channels; supplier-strikes.ts bans by it.
   supplier_id?: number;
+  // AdoRouter: the marketplace's own breaker, see isCooling.
+  circuit_status?: { state?: string } | null;
+  cooldown_status?: { state?: string } | null;
   supplier_name: string;
   channel_name: string;
   description: string;
@@ -253,6 +256,7 @@ export function selectMerchants(
         !excluded(r) &&
         r.charge_type === "per_token" &&
         r.listing_availability === 1 &&
+        !isCooling(r) &&
         !r.supplier_channel_disabled &&
         !r.user_channel_disabled &&
         r.input_price_micros > 0 &&
@@ -267,6 +271,17 @@ export function selectMerchants(
     )
     .sort((a, b) => a.input_price_micros - b.input_price_micros);
   return viable;
+}
+
+// AdoRouter: about a tenth of listings sit in the marketplace's own cooldown
+// (merchant out of credit, dead key, upstream timeouts; audit 2026-11-08). A
+// pinned cooling listing answers 503 fixed_merchant_circuit_open without
+// reaching the merchant, so keying and probing it only made the walk longer.
+export function isCooling(r: Listing): boolean {
+  return (
+    r.circuit_status?.state === "cooling" ||
+    r.cooldown_status?.state === "cooling"
+  );
 }
 
 export function usdPerMillion(micros: number): number {
