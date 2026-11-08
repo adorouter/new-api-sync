@@ -2,7 +2,12 @@ import {
   matchesAnyPattern,
   matchesBlacklist,
 } from "@core/catalog/constants/patterns";
-import { getEnabledModelGlobs, type RuntimeConfig } from "@core/config";
+import { inferModelType } from "@core/catalog/constants/inference";
+import {
+  getEnabledModelGlobs,
+  getTestModelTypes,
+  type RuntimeConfig,
+} from "@core/config";
 import { tryFetchJson } from "@core/infra/http";
 import { resolvePerModel } from "@core/pricing";
 import type { A7ProviderConfig } from "@core/validations/config";
@@ -127,7 +132,13 @@ export function resolveMarketplaceModels(
   names: string[],
 ): string[] {
   const globs = getEnabledModelGlobs(provider.enabledModels) ?? [];
+  // AdoRouter: only the model types the config tests (text here). A type the
+  // probe cannot test passed untested, so `--type text` had to guard the walk,
+  // and a filtered run deletes no lanes and cleans up no keys: every lane that
+  // later failed stayed live. With the guard here, full runs can delete again.
+  const allowedTypes = getTestModelTypes(config, provider);
   return names.filter((model) => {
+    if (!allowedTypes.has(inferModelType(model))) return false;
     if (matchesBlacklist(model, config.blacklist)) return false;
     if (globs.length > 0 && !matchesAnyPattern(model, globs)) return false;
     if (
