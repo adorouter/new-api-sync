@@ -10,6 +10,7 @@ import type {
   UpstreamOffer,
 } from "@core/pricing/offers";
 import { resolveMedianPricing } from "@core/pricing/resolver";
+import { CURATED_PRICING } from "@core/pricing/sources/curated";
 import { resolveCanonicalByVote } from "@core/pricing/vote";
 import { testAndFilterModels } from "@core/testing/runner";
 import { clearTestFail } from "@core/testing/verdict-cache";
@@ -69,6 +70,16 @@ function canonicalVote(
   ctx: ProviderRunContext,
 ): { modelRatio: number; completionRatio?: number } | undefined {
   const exposedName = (config.modelMapping?.[model] ?? model).toLowerCase();
+  // AdoRouter: a hand-checked rate card beats the vote here too, as it does in
+  // the canonical map the emitted lanes are priced against. Without this the
+  // sell ceiling and the live-lane sweep divided by the voted list while
+  // ModelRatio published the pinned one.
+  const pinned = CURATED_PRICING[exposedName];
+  if (pinned)
+    return {
+      modelRatio: pinned.modelRatio,
+      completionRatio: pinned.completionRatio,
+    };
   const cluster = resolveCanonicalByVote(
     exposedName,
     ctx.pricingSources,
