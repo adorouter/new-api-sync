@@ -4204,9 +4204,40 @@ const GLM_5_3_LIST: BaseModelPricing = {
   source: "curated",
   sourceKey: "zai/glm-5.3",
 };
+// AdoRouter: DeepSeek's own rate card, at its PEAK rates (decided 2026-11-08).
+// api-docs.deepseek.com/quick_start/pricing, 2026-11-07: off-peak is half of
+// peak. The sources disagreed (deepseek-v4.1-flash $0.156 in beside its own
+// snapshot at $0.30; deepseek-v4-pro still at an old $1.74 / $3.48). The
+// retired v4-flash names are served by V4.1-Flash-1017 at the Flash price, and
+// deepseek-v4-pro by V4-Pro-0813.
+const DEEPSEEK_FLASH_LIST: BaseModelPricing = {
+  // Flash peak: $0.30 in, $0.006 cache hit, $1.20 out.
+  modelRatio: 0.15,
+  completionRatio: 1.2 / 0.3,
+  cacheRatio: 0.006 / 0.3,
+  createCacheRatio: 1,
+  source: "curated",
+  sourceKey: "deepseek/deepseek-flash",
+};
+const DEEPSEEK_PRO_LIST: BaseModelPricing = {
+  // V4-Pro peak: $1.32 in, $0.044 cache hit, $3.96 out.
+  modelRatio: 0.66,
+  completionRatio: 3.96 / 1.32,
+  cacheRatio: 0.044 / 1.32,
+  createCacheRatio: 1,
+  source: "curated",
+  sourceKey: "deepseek/deepseek-v4-pro",
+};
 export const CURATED_PRICING: Record<string, BaseModelPricing> = {
   "glm-5.3": GLM_5_3_LIST,
   "or-glm-5.3": GLM_5_3_LIST,
+  "deepseek-v4.1-flash": DEEPSEEK_FLASH_LIST,
+  "deepseek-v4.1-flash-1017": DEEPSEEK_FLASH_LIST,
+  "deepseek-v4-flash": DEEPSEEK_FLASH_LIST,
+  "deepseek-v4-flash-0731": DEEPSEEK_FLASH_LIST,
+  "deepseek-v4-flash-vision-exp": DEEPSEEK_FLASH_LIST,
+  "deepseek-v4-pro": DEEPSEEK_PRO_LIST,
+  "deepseek-v4-pro-0813": DEEPSEEK_PRO_LIST,
 };
 
 export function buildCuratedSource(): PricingSource {
