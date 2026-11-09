@@ -123,7 +123,8 @@ async function measure(
   lane: NumberFingerprintLane,
 ): Promise<NumberFingerprintRecord> {
   // The bank was collected at low or no reasoning effort; a lane that refuses
-  // the field is measured once more without it.
+  // the field is measured once more without it. The marketplace refuses an
+  // unsupported field with 400 or with 404 ("does not match this request").
   let effort = "low";
   const round = (e: string) =>
     detector.detect({
@@ -138,7 +139,7 @@ async function measure(
   if (
     !result.analysis &&
     result.samples.every(
-      (s) => s.state === "failed" && /\b400\b/.test(s.error ?? ""),
+      (s) => s.state === "failed" && /\b40[04]\b/.test(s.error ?? ""),
     )
   ) {
     effort = "";
