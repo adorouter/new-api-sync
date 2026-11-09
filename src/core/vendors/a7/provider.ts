@@ -14,6 +14,7 @@ import { CURATED_PRICING } from "@core/pricing/sources/curated";
 import { resolveCanonicalByVote } from "@core/pricing/vote";
 import { testAndFilterModels } from "@core/testing/runner";
 import { isAuthenticityBlacklisted } from "@core/testing/authenticity";
+import { runNumberFingerprints } from "@core/testing/number-fingerprint";
 import {
   REASONING_FAIL_REASON,
   clearTestFail,
@@ -681,8 +682,10 @@ export async function processA7Provider(
     // A supplier struck on a later model loses the lanes it passed earlier in
     // the walk too. Offers are built only now, from what is left.
     let struckLanes = 0;
+    const finalKept: { lane: MerchantLane; key: string }[] = [];
     for (const { mc, kept: all } of keptByModel) {
       const kept = all.filter((k) => !strikes.isStruck(k.lane.listing));
+      finalKept.push(...kept);
       for (const k of all)
         if (strikes.isStruck(k.lane.listing))
           consola.warn(
@@ -720,6 +723,18 @@ export async function processA7Provider(
         `[${name}] supplier strikes: ${newStrikes.length} new, ${struckLanes} passing lane(s) dropped`,
       );
     if (!dryRun && newStrikes.length > 0) strikes.save();
+    // After the walk, on its own budget, so it never delays a model's probes.
+    if (!dryRun && provider.numberFingerprint)
+      await runNumberFingerprints(
+        name,
+        finalKept.map((k) => ({
+          key: `${name}:${k.lane.listing.channel_id}|${k.lane.model}`,
+          model: k.lane.model,
+          baseUrl,
+          apiKey: k.key,
+        })),
+        provider.numberFingerprint,
+      );
     if (deferredAt.length > 0) {
       const deferred = deferredAt
         .sort((a, b) => a - b)

@@ -281,4 +281,15 @@ These calls are best-effort: failures are logged as warnings and do not block th
 
 `logs/authenticity-blacklist.json` is maintained automatically by the test runner to track Anthropic Claude models from providers that failed authenticity checks. This is internal state, but entries can be reviewed and removed from the History tab in the UI.
 
+### Number Fingerprints (AdoRouter)
+
+With `numberFingerprint` set on an `a7` provider, every lane the walk keeps is asked three times for about 300 first-instinct integers, after the walk and on its own time budget, and the answers are ranked against the reference bank of [lm-detector](https://github.com/Ikaleio/lm-detector) (`lmfpd-sdk`, MIT, copyright 2026 xqy2006), pinned to one data version. Results go to `logs/number-fingerprint-<date>.jsonl` and `logs/number-fingerprints-<provider>.json`; a lane is measured again after `retestDays` (7). They are logged only and never reject a lane.
+
+```yaml
+numberFingerprint:
+  budgetMinutes: 30
+  retestDays: 7
+  lanesInParallel: 2
+```
+
 <!-- bun sync run --only nvda1,open1,open2 -->

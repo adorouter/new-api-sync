@@ -20,6 +20,7 @@
         "country-flag-icons": "1.6.17",
         "elysia": "1.4.30",
         "fast-equals": "6.0.0",
+        "lmfpd-sdk": "0.2.0",
         "lucide-react": "1.17.0",
         "micromatch": "4.0.8",
         "ofetch": "1.5.1",
@@ -572,6 +573,8 @@
     "kleur": ["kleur@4.1.5", "", {}, "sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ=="],
 
     "lines-and-columns": ["lines-and-columns@1.2.4", "", {}, "sha512-7ylylesZQ/PV29jhEDl3Ufjo6ZX7gCqJr5F7PKrqc93v7fzSymt1BpwEU8nAUXs8qzzvqhbjhK5QZg6Mt/HkBg=="],
+
+    "lmfpd-sdk": ["lmfpd-sdk@0.2.0", "", {}, "sha512-nW0lY2SJVtnvRibgaMIPfhMylO54/aHozUp/Yz5GHEWjNUZ8LAzyA6tYTI7Vbqm6qO2iI3+RcMbi27ibgzGmjQ=="],
 
     "locate-path": ["locate-path@3.0.0", "", { "dependencies": { "p-locate": "^3.0.0", "path-exists": "^3.0.0" } }, "sha512-7AO748wWnIhNqAuaty2ZWHkQHRSNfPVIsPIfwEOWO22AmaoVrWavlOcMR5nzTLNYvp36X220/maaRsrec1G65A=="],
 
