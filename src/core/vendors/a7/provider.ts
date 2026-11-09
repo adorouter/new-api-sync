@@ -465,22 +465,36 @@ export async function processA7Provider(
       consola.info(
         `[${name}] ${modelIdx}/${models.length} ${mc.model}: ${mc.candidates.length} candidate(s), want ${mc.wanted} (${elapsed()} in)`,
       );
-      const kept: { lane: MerchantLane; key: string; rateLimited: boolean }[] =
-        [];
+      const kept: {
+        lane: MerchantLane;
+        key: string;
+        rateLimited: boolean;
+        tools: boolean | null;
+        serving: boolean;
+      }[] = [];
       let serving = 0;
       let idx = 0;
       let probed = 0;
       let cachedRejects = 0;
+      // A lane that fails the tool test still serves plain chat, and the
+      // gateway sends tool requests only to lanes that passed it. When every
+      // serving lane failed it (2026-11-09: five models, one merchant on all
+      // its Gemini lanes), the walk keeps looking, one lane at a time inside
+      // the probe cap, and a lane that passes replaces the dearest one that
+      // failed.
+      const needsToolLane = () =>
+        !kept.some((k) => k.serving && k.tools === true) &&
+        kept.some((k) => k.serving && k.tools === false);
       while (
-        serving < mc.wanted &&
+        (serving < mc.wanted || needsToolLane()) &&
         idx < mc.candidates.length &&
         probed < A7_MAX_PROBES_PER_MODEL
       ) {
+        const room = serving < mc.wanted ? mc.wanted - serving : 1;
         // A supplier struck on another model since the walk began is passed over.
         const batch: MerchantLane[] = [];
         while (
-          batch.length <
-            Math.min(mc.wanted - serving, A7_MAX_PROBES_PER_MODEL - probed) &&
+          batch.length < Math.min(room, A7_MAX_PROBES_PER_MODEL - probed) &&
           idx < mc.candidates.length
         ) {
           const listing = mc.candidates[idx++]!;
@@ -598,15 +612,36 @@ export async function processA7Provider(
               );
             continue;
           }
+          const tools =
+            verdict.details?.find((d) => d.model === probe.lane.model)
+              ?.toolCallSuccess ?? null;
+          const exposed =
+            config.modelMapping?.[probe.lane.model] ?? probe.lane.model;
+          const isServing = !offLanes.has(
+            laneKey(probe.lane.listing.channel_id, exposed),
+          );
+          // Past `wanted` only the tool search probes, so only a lane that
+          // passes the tool test is worth a slot.
+          if (isServing && serving >= mc.wanted) {
+            if (tools !== true) continue;
+            const failed = kept.findLastIndex(
+              (k) => k.serving && k.tools === false,
+            );
+            if (failed < 0) continue;
+            consola.info(
+              `[${name}] ${mc.model}: ${probe.lane.listing.channel_id} passed the tool test, replacing ${kept[failed]!.lane.listing.channel_id}`,
+            );
+            kept.splice(failed, 1);
+            serving--;
+          }
           kept.push({
             lane: probe.lane,
             key: probe.key,
             rateLimited: verdict.rateLimitedModels.includes(probe.lane.model),
+            tools,
+            serving: isServing,
           });
-          const exposed =
-            config.modelMapping?.[probe.lane.model] ?? probe.lane.model;
-          if (!offLanes.has(laneKey(probe.lane.listing.channel_id, exposed)))
-            serving++;
+          if (isServing) serving++;
         }
         const held = kept.length - serving;
         consola.info(
@@ -621,8 +656,13 @@ export async function processA7Provider(
         consola.warn(
           `[${name}] ${mc.model}: probe cap of ${A7_MAX_PROBES_PER_MODEL} reached with ${serving}/${mc.wanted} serving, ${mc.candidates.length - idx} candidate(s) left for the next run`,
         );
+      if (needsToolLane())
+        consola.warn(
+          `[${name}] ${mc.model}: no lane passed the tool test, so tool requests to it fail`,
+        );
+      const toolLanes = kept.filter((k) => k.tools === true).length;
       consola.info(
-        `[${name}] ${mc.model} done: ${kept.length} lane(s) in ${Math.round((Date.now() - modelStart) / 1000)}s, ${cachedRejects} cached reject(s) skipped, ${models.length - modelIdx} model(s) left`,
+        `[${name}] ${mc.model} done: ${kept.length} lane(s) (${toolLanes} with tools) in ${Math.round((Date.now() - modelStart) / 1000)}s, ${cachedRejects} cached reject(s) skipped, ${models.length - modelIdx} model(s) left`,
       );
       if (kept.length > 0) keptByModel.push({ mc, kept });
     };
