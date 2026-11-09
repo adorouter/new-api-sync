@@ -13,7 +13,13 @@ import { resolveMedianPricing } from "@core/pricing/resolver";
 import { CURATED_PRICING } from "@core/pricing/sources/curated";
 import { resolveCanonicalByVote } from "@core/pricing/vote";
 import { testAndFilterModels } from "@core/testing/runner";
-import { clearTestFail } from "@core/testing/verdict-cache";
+import { isAuthenticityBlacklisted } from "@core/testing/authenticity";
+import {
+  REASONING_FAIL_REASON,
+  clearTestFail,
+  getVerdict,
+  isTestFailFresh,
+} from "@core/testing/verdict-cache";
 import { evictLaneKey, laneKeyStats } from "@core/infra/lane-keys";
 import { parseDisableReason } from "@core/vendors/newapi/disable-reason";
 import type { MergedGroup, ProviderReport } from "@core/types";
@@ -23,6 +29,7 @@ import { consola } from "consola";
 import pLimit from "p-limit";
 import { t } from "@server/i18n";
 import { SupplierStrikes, supplierKeyOf } from "./supplier-strikes";
+import { WalkOrder } from "./walk-order";
 import {
   DEFAULT_MAX_SELL_FRACTION,
   DEFAULT_PROFIT_MULTIPLE,
@@ -54,6 +61,11 @@ const THROTTLE_FAIL_RATIO = 0.2;
 // like a model the marketplace could not describe this run.
 const WALK_BUDGET_MS = 150 * 60_000;
 const A7_MODEL_PARALLEL = 3;
+// AdoRouter: lanes a model may send to the upstream before the walk moves on,
+// keeping whatever passed. Candidates the verdict cache already rejects cost
+// nothing and do not count. hy4-preview probed 42 fakes for an hour on
+// 2026-11-08 and minimax-m3.1-flash 19, which left 69 models unwalked.
+const A7_MAX_PROBES_PER_MODEL = 12;
 
 interface ModelCandidates {
   model: string;
@@ -418,6 +430,18 @@ export async function processA7Provider(
     let pinsRepinned = 0;
     let throttled = 0;
 
+    const walkOrder = new WalkOrder(name);
+    models.splice(0, models.length, ...walkOrder.sort(models));
+    // A candidate whose rejection is still cached would only be keyed and
+    // pinned to replay that rejection, so it is passed over. Its token stays
+    // (probedLanes), like any rejected candidate's.
+    const rejectedFromCache = (lane: MerchantLane): boolean => {
+      const key = `${name}:${lane.listing.channel_id}|${lane.model}`;
+      const verdict = getVerdict(key);
+      if (verdict?.authenticityReason === REASONING_FAIL_REASON) return false;
+      return isAuthenticityBlacklisted(key) || isTestFailFresh(verdict);
+    };
+
     const loopStart = Date.now();
     const elapsed = () => `${Math.round((Date.now() - loopStart) / 1000)}s`;
     const deferredAt: number[] = [];
@@ -430,6 +454,7 @@ export async function processA7Provider(
         return;
       }
       const modelStart = Date.now();
+      if (!dryRun) walkOrder.markWalked(mc.model);
       // Walk the cheap-sorted candidates until `wanted` merchants pass their
       // probe: a faker/dead pick is REPLACED by the next candidate instead of
       // shrinking the lane set (opus-5 hit zero lanes that way: the cheapest 6
@@ -445,16 +470,28 @@ export async function processA7Provider(
       let serving = 0;
       let idx = 0;
       let probed = 0;
-      while (serving < mc.wanted && idx < mc.candidates.length) {
+      let cachedRejects = 0;
+      while (
+        serving < mc.wanted &&
+        idx < mc.candidates.length &&
+        probed < A7_MAX_PROBES_PER_MODEL
+      ) {
         // A supplier struck on another model since the walk began is passed over.
         const batch: MerchantLane[] = [];
         while (
-          batch.length < mc.wanted - serving &&
+          batch.length <
+            Math.min(mc.wanted - serving, A7_MAX_PROBES_PER_MODEL - probed) &&
           idx < mc.candidates.length
         ) {
           const listing = mc.candidates[idx++]!;
-          if (!strikes.isStruck(listing))
-            batch.push({ model: mc.model, listing });
+          if (strikes.isStruck(listing)) continue;
+          const lane = { model: mc.model, listing };
+          if (rejectedFromCache(lane)) {
+            cachedRejects++;
+            probedLanes.push(lane);
+            continue;
+          }
+          batch.push(lane);
         }
         if (batch.length === 0) break;
         consola.info(
@@ -576,8 +613,16 @@ export async function processA7Provider(
           `[${name}] ${mc.model}: kept ${serving}/${mc.wanted}${held > 0 ? ` (+${held} held, gateway disabled)` : ""}, probed ${probed}, ${mc.candidates.length - idx} candidate(s) left`,
         );
       }
+      if (
+        serving < mc.wanted &&
+        probed >= A7_MAX_PROBES_PER_MODEL &&
+        idx < mc.candidates.length
+      )
+        consola.warn(
+          `[${name}] ${mc.model}: probe cap of ${A7_MAX_PROBES_PER_MODEL} reached with ${serving}/${mc.wanted} serving, ${mc.candidates.length - idx} candidate(s) left for the next run`,
+        );
       consola.info(
-        `[${name}] ${mc.model} done: ${kept.length} lane(s) in ${Math.round((Date.now() - modelStart) / 1000)}s, ${models.length - modelIdx} model(s) left`,
+        `[${name}] ${mc.model} done: ${kept.length} lane(s) in ${Math.round((Date.now() - modelStart) / 1000)}s, ${cachedRejects} cached reject(s) skipped, ${models.length - modelIdx} model(s) left`,
       );
       if (kept.length > 0) keptByModel.push({ mc, kept });
     };
@@ -591,6 +636,7 @@ export async function processA7Provider(
     await Promise.all(
       models.map((mc, i) => walkLimit(() => walkModel(mc, i + 1))),
     );
+    if (!dryRun) walkOrder.save();
 
     // A supplier struck on a later model loses the lanes it passed earlier in
     // the walk too. Offers are built only now, from what is left.
