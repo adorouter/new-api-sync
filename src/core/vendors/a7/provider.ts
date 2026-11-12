@@ -1,5 +1,6 @@
 import { CHANNEL_TYPES } from "@core/catalog/constants/channel-types";
 import { resolvePerModel } from "@core/pricing";
+import { publishedGroupRatio } from "@core/pricing/group-ratio";
 import { inferModelType } from "@core/catalog/constants/inference";
 import { sanitizeGroupName } from "@core/catalog/constants/patterns";
 import type { RuntimeConfig } from "@core/config";
@@ -236,7 +237,7 @@ function sweepLiveLanes(
     );
     out.push({
       name: ch.group,
-      ratio: Math.round(ratio * 10000) / 10000,
+      ratio: publishedGroupRatio(ratio),
       description: `${market} via ${provider.name} merchant #${listing.channel_id}`,
       provider: provider.name,
     });

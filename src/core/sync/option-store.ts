@@ -3,6 +3,7 @@ import {
   modelsOnChannels,
   parseModelList,
 } from "@core/catalog/constants/patterns";
+import { publishedGroupRatio } from "@core/pricing/group-ratio";
 import type { Channel, PricingAudit } from "@core/types";
 import {
   GROUP_OPTION_KEYS,
@@ -359,7 +360,7 @@ export class OptionStore {
         for (const model of parseModelList(ch.models ?? "")) {
           const factor = factors.get(model);
           if (factor === undefined) continue;
-          rescaled[g] = Math.round(old * factor * 10000) / 10000;
+          rescaled[g] = publishedGroupRatio(old * factor);
           break;
         }
       }

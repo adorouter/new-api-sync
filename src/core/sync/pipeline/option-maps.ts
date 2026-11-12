@@ -1,6 +1,7 @@
 import { inferModelType } from "@core/catalog/constants/inference";
 import type { RuntimeConfig } from "@core/config";
 import { isFixed } from "@core/pricing/compute";
+import { publishedGroupRatio } from "@core/pricing/group-ratio";
 import { parseJsonObject } from "@core/sync/option-store";
 import type {
   GridPricingInfo,
@@ -96,7 +97,7 @@ export function buildOptionMaps(
   };
 
   for (const group of mergedGroups) {
-    groupRatio[group.name] = r4(group.ratio);
+    groupRatio[group.name] = publishedGroupRatio(group.ratio);
     userUsableGroups[group.name] = group.description;
   }
 
