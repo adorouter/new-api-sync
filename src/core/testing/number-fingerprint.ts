@@ -4,11 +4,18 @@
 // lanes, which may be the fakes. lm-detector (MIT, github.com/Ikaleio/lm-detector)
 // asks for about 300 first-instinct integers three times and ranks the answers
 // against a bank collected from official routes. It is right about 9 times in
-// 10 on its own held-out set and always names a closest model, so it only
-// logs: nothing here rejects a lane.
+// 10 on its own held-out set and always names a closest model, so one reading
+// never decides anything. With `enforce` on, a lane is rejected only when two
+// readings from separate runs both name another model with confidence
+// (fingerprintReject); every other result only logs. Lanes whose model is in
+// the bank are measured first, since only they can be judged.
 
 import { readJson, writeJsonAtomic } from "@core/infra/fs";
 import { logsDir } from "@core/infra/paths";
+import {
+  NUMBER_FINGERPRINT_FAIL_PREFIX,
+  setAuthenticityVerdict,
+} from "@core/testing/verdict-cache";
 import { consola } from "consola";
 import { appendFileSync, mkdirSync } from "fs";
 import {
@@ -69,7 +76,64 @@ export type NumberFingerprintOptions = {
   budgetMinutes?: number;
   retestDays?: number;
   lanesInParallel?: number;
+  /** Reject lanes that fingerprintReject convicts; off, they are only logged. */
+  enforce?: boolean;
 };
+
+// A reading counts against a lane only when the bank knows the claimed model,
+// all three replies were scored, at least two came back complete, and the
+// closest model is another one at this probability or more. The first pass
+// (2026-11-09) gave 98 to 100% on every tier downgrade it found, and 30 to 40%
+// on the readings that looked like noise.
+export const REJECT_PROBABILITY = 0.95;
+const MIN_COMPLETE_SAMPLES = 2;
+// Readings this far apart come from separate runs.
+const MIN_READING_GAP_MS = 20 * 60 * 60 * 1000;
+
+// The bank's older Claude references came through resellers, so a Claude lane
+// read as another version of its own tier proves nothing. A lower tier does
+// (an Opus lane answering like Haiku), and so does another family.
+const CLAUDE_TIERS = ["haiku", "sonnet", "opus", "fable", "mythos"];
+const claudeTier = (id: string) =>
+  CLAUDE_TIERS.findIndex((t) => id.toLowerCase().includes(`claude-${t}`));
+
+/** The model one reading says the lane really serves, or null when it says nothing firm. */
+export function confidentOther(r: NumberFingerprintRecord): string | null {
+  if (!r.claimed || r.decision !== "scored") return null;
+  if (!r.prediction || r.prediction === r.claimed) return null;
+  if ((r.probability ?? 0) < REJECT_PROBABILITY) return null;
+  const complete = r.samples.filter((s) => s.state === "complete").length;
+  if (complete < MIN_COMPLETE_SAMPLES) return null;
+  if (r.claimedFamily === "claude" && r.family === "claude") {
+    const want = claudeTier(r.claimed);
+    const got = claudeTier(r.prediction);
+    if (want < 0 || got < 0 || got >= want) return null;
+  }
+  return r.prediction;
+}
+
+/**
+ * The fail reason when this reading and the lane's previous one, from an earlier
+ * run, both name another model of the same family; otherwise null.
+ */
+export function fingerprintReject(
+  current: NumberFingerprintRecord,
+  previous: NumberFingerprintRecord | undefined,
+): string | null {
+  const now = confidentOther(current);
+  if (!now || !previous) return null;
+  const before = confidentOther(previous);
+  if (!before) return null;
+  if (previous.claimed !== current.claimed) return null;
+  if (previous.family !== current.family) return null;
+  if (Date.parse(current.at) - Date.parse(previous.at) < MIN_READING_GAP_MS)
+    return null;
+  const reads =
+    before === now
+      ? now
+      : `${before} on ${previous.at.slice(0, 10)}, then ${now}`;
+  return `${NUMBER_FINGERPRINT_FAIL_PREFIX}: sold as ${current.claimed}, answers like ${reads} (${pct(current.probability)}) on two runs`;
+}
 
 const ledgerPath = (provider: string) =>
   join(logsDir(), `number-fingerprints-${provider}.json`);
@@ -203,7 +267,7 @@ function report(
       return;
     case "family-mismatch":
       consola.warn(
-        `${where}: number fingerprint says ${says}, claimed family ${r.claimedFamily}, observed only`,
+        `${where}: number fingerprint says ${says}, claimed family ${r.claimedFamily}`,
       );
       return;
     case "not-model":
@@ -218,36 +282,48 @@ function report(
   }
 }
 
+// The bank's model ids, read by scoring a made-up reply offline: a partial
+// ranking lists every candidate. Empty when that ever stops working, which only
+// loses the ordering.
+function bankModels(detector: Detector): Set<string> {
+  const text = Array.from({ length: 300 }, (_, i) => ((i * 37) % 355) + 1).join(
+    ", ",
+  );
+  try {
+    const a = detector.analyze([{ text, expected_count: 300 }]);
+    return new Set(a.results.map((r) => norm(r.model)));
+  } catch {
+    return new Set();
+  }
+}
+
 /**
- * Measures the lanes whose last measurement is older than `retestDays`, never
- * measured first, until `budgetMinutes` is spent. Every result goes to the
- * ledger and to `number-fingerprint-<day>.jsonl`; a failure to load the bank
- * skips the pass and never fails the run.
+ * Measures the lanes whose last measurement is older than `retestDays` until
+ * `budgetMinutes` is spent: lanes whose model is in the bank first (a lane with
+ * one confident reading of another model before the rest), then the others,
+ * never measured before long ago. Every result goes to the ledger and to
+ * `number-fingerprint-<day>.jsonl`; a failure to load the bank skips the pass
+ * and never fails the run. Returns the keys of the lanes rejected this run.
  */
 export async function runNumberFingerprints(
   provider: string,
   lanes: NumberFingerprintLane[],
   opts: NumberFingerprintOptions,
-): Promise<void> {
+): Promise<Set<string>> {
+  const rejected = new Set<string>();
   const ledger =
     readJson<Record<string, NumberFingerprintRecord>>(ledgerPath(provider)) ??
     {};
   const retestMs = (opts.retestDays ?? 7) * 86_400_000;
-  const due = lanes
-    .filter((l) => {
-      const at = ledger[l.key]?.at;
-      return !at || Date.now() - Date.parse(at) >= retestMs;
-    })
-    .sort(
-      (a, b) =>
-        (Date.parse(ledger[a.key]?.at ?? "") || 0) -
-        (Date.parse(ledger[b.key]?.at ?? "") || 0),
-    );
+  const due = lanes.filter((l) => {
+    const at = ledger[l.key]?.at;
+    return !at || Date.now() - Date.parse(at) >= retestMs;
+  });
   if (due.length === 0) {
     consola.info(
       `[${provider}] number fingerprints: all ${lanes.length} lane(s) measured lately`,
     );
-    return;
+    return rejected;
   }
 
   let detector: Detector;
@@ -261,8 +337,25 @@ export async function runNumberFingerprints(
     consola.warn(
       `[${provider}] number fingerprints skipped: reference bank did not load (${err instanceof Error ? err.message : String(err)})`,
     );
-    return;
+    return rejected;
   }
+
+  const bank = bankModels(detector);
+  const rank = (l: NumberFingerprintLane) => {
+    if (bank.size > 0 && !bank.has(norm(bareName(l.model)))) return 2;
+    const last = ledger[l.key];
+    return last && confidentOther(last) ? 0 : 1;
+  };
+  due.sort(
+    (a, b) =>
+      rank(a) - rank(b) ||
+      (Date.parse(ledger[a.key]?.at ?? "") || 0) -
+        (Date.parse(ledger[b.key]?.at ?? "") || 0),
+  );
+  const inBank = due.filter((l) => rank(l) < 2).length;
+  consola.info(
+    `[${provider}] number fingerprints: ${due.length} lane(s) due, ${inBank} with their model in the bank${opts.enforce ? "" : ", observe only"}`,
+  );
 
   const start = Date.now();
   const budgetMs = (opts.budgetMinutes ?? 30) * 60_000;
@@ -294,11 +387,20 @@ export async function runNumberFingerprints(
           JSON.stringify({ key: lane.key, ...record }) + "\n",
         );
         // An unscored lane (busy, refused, cut off) is measured again next run.
+        const previous = ledger[lane.key];
         if (record.verdict !== "unscored") {
           ledger[lane.key] = record;
           writeJsonAtomic(ledgerPath(provider), ledger, { pretty: true });
         }
         report(provider, lane, record);
+        const reason = fingerprintReject(record, previous);
+        if (!reason) return;
+        if (opts.enforce) {
+          rejected.add(lane.key);
+          setAuthenticityVerdict(lane.key, "fail", reason);
+          consola.warn(`[${provider}] ${lane.key}: rejected, ${reason}`);
+        } else
+          consola.warn(`[${provider}] ${lane.key}: would reject, ${reason}`);
       }),
     ),
   );
@@ -306,6 +408,7 @@ export async function runNumberFingerprints(
     .map(([v, n]) => `${n} ${v}`)
     .join(", ");
   consola.info(
-    `[${provider}] number fingerprints: ${summary || "none measured"} in ${Math.round((Date.now() - start) / 1000)}s${skipped > 0 ? `, ${skipped} lane(s) left for the next run` : ""}`,
+    `[${provider}] number fingerprints: ${summary || "none measured"} in ${Math.round((Date.now() - start) / 1000)}s${skipped > 0 ? `, ${skipped} lane(s) left for the next run` : ""}${rejected.size > 0 ? `, ${rejected.size} rejected` : ""}`,
   );
+  return rejected;
 }

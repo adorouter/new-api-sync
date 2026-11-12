@@ -689,10 +689,14 @@ export async function processA7Provider(
     // A supplier struck on a later model loses the lanes it passed earlier in
     // the walk too. Offers are built only now, from what is left.
     let struckLanes = 0;
-    const finalKept: { lane: MerchantLane; key: string }[] = [];
+    const verdictKey = (lane: MerchantLane) =>
+      `${name}:${lane.listing.channel_id}|${lane.model}`;
+    const survivors: {
+      mc: (typeof models)[number];
+      kept: (typeof keptByModel)[number]["kept"];
+    }[] = [];
     for (const { mc, kept: all } of keptByModel) {
       const kept = all.filter((k) => !strikes.isStruck(k.lane.listing));
-      finalKept.push(...kept);
       for (const k of all)
         if (strikes.isStruck(k.lane.listing))
           consola.warn(
@@ -702,6 +706,38 @@ export async function processA7Provider(
               .join(", ")}`,
           );
       struckLanes += all.length - kept.length;
+      if (kept.length > 0) survivors.push({ mc, kept });
+    }
+    const newStrikes = strikes.newStrikes();
+    if (strikes.enabled)
+      consola.info(
+        `[${name}] supplier strikes: ${newStrikes.length} new, ${struckLanes} passing lane(s) dropped`,
+      );
+    if (!dryRun && newStrikes.length > 0) strikes.save();
+
+    // After the walk, on its own budget, so it never delays a model's probes.
+    // AdoRouter: before the offers, so a lane the fingerprint rule rejects
+    // (number-fingerprint.ts, `enforce`) is left out of this run already.
+    const fingerprintRejected =
+      !dryRun && provider.numberFingerprint
+        ? await runNumberFingerprints(
+            name,
+            survivors.flatMap(({ kept }) =>
+              kept.map((k) => ({
+                key: verdictKey(k.lane),
+                model: k.lane.model,
+                baseUrl,
+                apiKey: k.key,
+              })),
+            ),
+            provider.numberFingerprint,
+          )
+        : new Set<string>();
+
+    for (const { mc, kept: all } of survivors) {
+      const kept = all.filter(
+        (k) => !fingerprintRejected.has(verdictKey(k.lane)),
+      );
       if (kept.length === 0) continue;
       keptLanes.push(...kept.map((k) => k.lane));
 
@@ -726,24 +762,6 @@ export async function processA7Provider(
           ),
         );
     }
-    const newStrikes = strikes.newStrikes();
-    if (strikes.enabled)
-      consola.info(
-        `[${name}] supplier strikes: ${newStrikes.length} new, ${struckLanes} passing lane(s) dropped`,
-      );
-    if (!dryRun && newStrikes.length > 0) strikes.save();
-    // After the walk, on its own budget, so it never delays a model's probes.
-    if (!dryRun && provider.numberFingerprint)
-      await runNumberFingerprints(
-        name,
-        finalKept.map((k) => ({
-          key: `${name}:${k.lane.listing.channel_id}|${k.lane.model}`,
-          model: k.lane.model,
-          baseUrl,
-          apiKey: k.key,
-        })),
-        provider.numberFingerprint,
-      );
     if (deferredAt.length > 0) {
       const deferred = deferredAt
         .sort((a, b) => a - b)
