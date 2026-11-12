@@ -28,7 +28,9 @@ import pLimit from "p-limit";
 import { join } from "path";
 
 // Pinned: a new bank changes every verdict, so it is taken on deliberately.
-const DATA_VERSION = "0.0.1793708131735";
+// 2026-11-11 build, 69 models (adds claude-fable-5.2, gemini-4-carbon and
+// muse-ember to the 2026-11-03 one).
+const DATA_VERSION = "0.0.1794360871947";
 const DATA_URL = `https://cdn.jsdelivr.net/npm/lmfpd-data@${DATA_VERSION}/`;
 
 export type NumberFingerprintVerdict =
