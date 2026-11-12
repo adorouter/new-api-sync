@@ -170,6 +170,33 @@ export function authenticityPassTtlHours(baseUrl?: string): number {
 
 export const AUTHENTICITY_FAIL_TTL_HOURS = 24;
 
+// AdoRouter: fails that rest on evidence a merchant cannot produce by accident
+// stay for 30 days instead of one. Marketplace runs are days apart, so a 24
+// hour fail had always expired by the next run: every caught faker was keyed
+// and probed again, and one that fakes only some of the time got a fresh chance
+// each run. These are the reply's own model field naming another model, another
+// maker's tokenizer or made-up token counts, a hidden instruction to conceal the
+// backend, and a confirmed number fingerprint of another model.
+export const AUTHENTICITY_HARD_FAIL_TTL_DAYS = 30;
+export const NUMBER_FINGERPRINT_FAIL_PREFIX = "number-fingerprint";
+const HARD_FAIL_PREFIXES = [
+  "substituted",
+  "served-model-mismatch",
+  "tokenizer-family",
+  "masked-identity",
+  NUMBER_FINGERPRINT_FAIL_PREFIX,
+];
+
+export function isHardAuthenticityFail(reason: string | undefined): boolean {
+  return !!reason && HARD_FAIL_PREFIXES.some((p) => reason.startsWith(p));
+}
+
+function authenticityFailTtlMs(reason: string | undefined): number {
+  return isHardAuthenticityFail(reason)
+    ? AUTHENTICITY_HARD_FAIL_TTL_DAYS * DAY_MS
+    : AUTHENTICITY_FAIL_TTL_HOURS * 60 * 60 * 1000;
+}
+
 // Entries from before authFailedAt existed carry only the fail date in
 // `since`; that date counts as the fail time so they expire the same way.
 export function isAuthenticityFailFresh(
@@ -178,7 +205,7 @@ export function isAuthenticityFailFresh(
   if (entry?.authenticity !== "fail") return false;
   const at = Date.parse(entry.authFailedAt ?? entry.since);
   if (!Number.isFinite(at)) return true;
-  return Date.now() - at < AUTHENTICITY_FAIL_TTL_HOURS * 60 * 60 * 1000;
+  return Date.now() - at < authenticityFailTtlMs(entry.authenticityReason);
 }
 
 // Only lanes rechecked on a slow cadence earn longer passes: marketplace
