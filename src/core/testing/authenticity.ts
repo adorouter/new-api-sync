@@ -31,6 +31,7 @@ import {
 } from "./answer-fingerprints";
 import { consola } from "consola";
 import { cannedReplyMarker } from "./canned-replies";
+import { KIRO_FAIL_PREFIX, kiroRejectReason } from "./kiro-lanes";
 import { recordProbeRequestId } from "./probe-ids";
 import type { AuthenticityProbeLog } from "./types";
 import {
@@ -365,6 +366,33 @@ export async function runAuthenticity(
     setAuthenticityVerdict(opts.logKey, "fail", reason);
     consola.warn(
       t("CORE.TESTER.AUTHENTICITY_ADDED", { key: opts.logKey, reason }),
+    );
+    return { authentic: false, ...(fingerprint ? { fingerprint } : {}) };
+  }
+
+  // AdoRouter: judged for every maker, like the canned reply above.
+  const wrapped = kiroRejectReason([
+    ...run.probes
+      .filter((p) => p.label === "identity" || p.label === "model-name")
+      .map((p) => p.responseText),
+    ...(run.reports.survey ?? [])
+      .filter((s) => ["self", "json", "system-prompt"].includes(s.label))
+      .map((s) => s.answer),
+  ]);
+  if (wrapped) {
+    consola.warn(
+      t("CORE.TESTER.AUTHENTICITY_FAIL", {
+        model: opts.model,
+        rule: KIRO_FAIL_PREFIX,
+        reason: wrapped,
+      }),
+    );
+    setAuthenticityVerdict(opts.logKey, "fail", wrapped);
+    consola.warn(
+      t("CORE.TESTER.AUTHENTICITY_ADDED", {
+        key: opts.logKey,
+        reason: wrapped,
+      }),
     );
     return { authentic: false, ...(fingerprint ? { fingerprint } : {}) };
   }

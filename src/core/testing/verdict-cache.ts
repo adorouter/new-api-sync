@@ -7,6 +7,7 @@ import { join } from "path";
 import { t } from "@server/i18n";
 import type { VerdictStore } from "@core/infra/verdict-store";
 import { hostOf } from "@core/infra/concurrency";
+import { KIRO_FAIL_PREFIX } from "./kiro-lanes";
 
 // ONE verdict file for every model+group pair: general test verdicts
 // (http/stream/tool) AND claude authenticity. Key: `${provider}|${model}` (same
@@ -176,7 +177,8 @@ export const AUTHENTICITY_FAIL_TTL_HOURS = 24;
 // and probed again, and one that fakes only some of the time got a fresh chance
 // each run. These are the reply's own model field naming another model, another
 // maker's tokenizer or made-up token counts, a hidden instruction to conceal the
-// backend, and a confirmed number fingerprint of another model.
+// backend, a confirmed number fingerprint of another model, and a lane that
+// answers as Kiro (a Kiro seat stays one).
 export const AUTHENTICITY_HARD_FAIL_TTL_DAYS = 30;
 export const NUMBER_FINGERPRINT_FAIL_PREFIX = "number-fingerprint";
 const HARD_FAIL_PREFIXES = [
@@ -185,6 +187,7 @@ const HARD_FAIL_PREFIXES = [
   "tokenizer-family",
   "masked-identity",
   NUMBER_FINGERPRINT_FAIL_PREFIX,
+  KIRO_FAIL_PREFIX,
 ];
 
 export function isHardAuthenticityFail(reason: string | undefined): boolean {
