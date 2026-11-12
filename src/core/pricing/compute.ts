@@ -578,9 +578,12 @@ function processStandardOffer(
         // 3.14 list), so priced on input its output sold at a sixth of cost and the cost
         // floor billed users 6x the shown rate. Price it on whichever side costs more.
         // Not from si's own list price: it gives glm-5.2 input as $0.006/M.
+        // AdoRouter: a7 (m1) too; its merchants were priced on input alone.
         const upstreamRatio =
           m.upstreamRatio !== undefined &&
-          (offer.providerKind === "si" || offer.providerKind === "ih") &&
+          (offer.providerKind === "si" ||
+            offer.providerKind === "ih" ||
+            offer.providerKind === "a7") &&
           m.upstreamCompletionRatio !== undefined &&
           written.completionRatio > 0
             ? Math.max(

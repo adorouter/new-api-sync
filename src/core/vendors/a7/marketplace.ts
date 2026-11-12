@@ -66,6 +66,29 @@ export const DEFAULT_PROFIT_MULTIPLE = 2;
 // would sell above list is rejected; the per-model knob only tightens that.
 export const DEFAULT_MAX_SELL_FRACTION = 1;
 
+/** A model's official list price, USD per million tokens. */
+export interface ListPrice {
+  inputUsd: number;
+  outputUsd: number;
+}
+
+/**
+ * AdoRouter: a merchant's cost as a share of list, on whichever side costs more.
+ * Merchants discount input and output by different amounts (one sold input at 5%
+ * of list and output at 40%), and a lane has one group ratio for both, so it is
+ * priced, capped and ranked on the dearer side. Priced on input alone, that lane
+ * sold output at 10% of list while paying 40%.
+ */
+export function costShareOfList(
+  r: Pick<Listing, "input_price_micros" | "output_price_micros">,
+  list: ListPrice,
+): number {
+  return Math.max(
+    usdPerMillion(r.input_price_micros) / list.inputUsd,
+    usdPerMillion(r.output_price_micros) / list.outputUsd,
+  );
+}
+
 export function marketplaceHeaders(
   provider: A7ProviderConfig,
 ): Record<string, string> {
@@ -197,17 +220,19 @@ export async function fetchListingsByModel(
 // cost * profitMultiple would sell above it is rejected. Cuts:
 //   1. health: available, per-token, and not proven-bad (see PROVEN_SAMPLE_COUNT);
 //   2. ceiling: cost * profitMultiple <= canonicalList * maxSellFraction (kimi-k3
-//      list $15, 0.5 => sell <= $7.50 => merchant output cost <= $3.75);
+//      list $15, 0.5 => sell <= $7.50 => merchant output cost <= $3.75), on
+//      input and output both (costShareOfList);
 //   3. count: the CALLER takes hostsPerModel merchants from the front; the full
 //      viable list is returned so a merchant that fails its live probe can be
 //      replaced by the next-cheapest candidate instead of shrinking the lane set.
-// canonicalListUsd is the voted list output price in USD/1M; undefined skips the
-// ceiling cut, matching how the rest of the engine degrades without canonical.
+// list is the voted list price in USD/1M; undefined skips the ceiling cut,
+// matching how the rest of the engine degrades without canonical, and ranks
+// merchants on input price alone.
 export function selectMerchants(
   model: string,
   rows: Listing[],
   provider: A7ProviderConfig,
-  canonicalListUsd: number | undefined,
+  list: ListPrice | undefined,
   blacklist?: string[],
 ): Listing[] {
   const minSuccess = resolvePerModel(
@@ -225,10 +250,12 @@ export function selectMerchants(
     model,
     DEFAULT_MAX_SELL_FRACTION,
   );
-  const sellCeilingUsd =
-    canonicalListUsd !== undefined
-      ? canonicalListUsd * maxSellFraction
+  const priced =
+    list !== undefined && list.inputUsd > 0 && list.outputUsd > 0
+      ? list
       : undefined;
+  const share = (r: Listing) =>
+    priced ? costShareOfList(r, priced) : r.input_price_micros;
 
   // Provider-scoped blacklist entries (a7/*kiro*) also fence merchant METADATA,
   // so a seller type can be banned without banning the model it sells. Only
@@ -276,11 +303,9 @@ export function selectMerchants(
           r.recent_success_rate < minSuccess
         ) &&
         (!provider.guaranteedOnly || r.authenticity_guaranteed) &&
-        (sellCeilingUsd === undefined ||
-          usdPerMillion(r.output_price_micros) * profitMultiple <=
-            sellCeilingUsd),
+        (priced === undefined || share(r) * profitMultiple <= maxSellFraction),
     )
-    .sort((a, b) => a.input_price_micros - b.input_price_micros);
+    .sort((a, b) => share(a) - share(b));
   return viable;
 }
 

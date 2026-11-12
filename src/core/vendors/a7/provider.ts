@@ -34,6 +34,7 @@ import { WalkOrder } from "./walk-order";
 import {
   DEFAULT_MAX_SELL_FRACTION,
   DEFAULT_PROFIT_MULTIPLE,
+  costShareOfList,
   fetchListingsByModel,
   fetchA7Quota,
   fetchMarketplaceModelNames,
@@ -41,6 +42,7 @@ import {
   selectMerchants,
   usdPerMillion,
   type Listing,
+  type ListPrice,
 } from "./marketplace";
 import {
   channelLane,
@@ -73,6 +75,7 @@ interface ModelCandidates {
   candidates: Listing[];
   wanted: number;
   canonicalListUsd?: number;
+  list?: ListPrice;
 }
 
 // Vote on the mapped (canonical) name: the marketplace spelling
@@ -112,15 +115,15 @@ function canonicalVote(
     : undefined;
 }
 
-function canonicalListUsdFor(
+function canonicalListFor(
   model: string,
   config: RuntimeConfig,
   ctx: ProviderRunContext,
-): number | undefined {
+): ListPrice | undefined {
   const cluster = canonicalVote(model, config, ctx);
-  return cluster
-    ? cluster.modelRatio * USD_PER_M_PER_RATIO * (cluster.completionRatio ?? 1)
-    : undefined;
+  if (!cluster) return undefined;
+  const inputUsd = cluster.modelRatio * USD_PER_M_PER_RATIO;
+  return { inputUsd, outputUsd: inputUsd * (cluster.completionRatio ?? 1) };
 }
 
 // Retail multiple for one lane. minSellFraction is a floor, not a merchant
@@ -216,8 +219,11 @@ function sweepLiveLanes(
       usdPerMillion(listing.output_price_micros),
       listUsd,
     );
-    const laneInputRatio =
-      usdPerMillion(listing.input_price_micros) / USD_PER_M_PER_RATIO;
+    // AdoRouter: priced on the dearer side, as compute prices the emitted lanes.
+    const costShare = costShareOfList(listing, {
+      inputUsd: cluster.modelRatio * USD_PER_M_PER_RATIO,
+      outputUsd: listUsd,
+    });
     const minSell = resolvePerModel(provider.minSellFraction, market, 0);
     const maxSell = resolvePerModel(
       provider.maxSellFraction,
@@ -225,7 +231,7 @@ function sweepLiveLanes(
       DEFAULT_MAX_SELL_FRACTION,
     );
     const ratio = Math.min(
-      Math.max((multiple * laneInputRatio) / cluster.modelRatio, minSell),
+      Math.max(multiple * costShare, minSell),
       Math.max(maxSell, minSell),
     );
     out.push({
@@ -257,15 +263,16 @@ function collectCandidates(
   // cuts in resolveMarketplaceModels.
   for (const [model, rows] of byModel) {
     // Cap cut: reject a merchant whose cost * profitMultiple breaches 1x list.
-    // The vote's modelRatio is the input price in ratio units; USD list output.
-    const canonicalListUsd = canonicalListUsdFor(model, config, ctx);
+    // The vote's modelRatio is the input price in ratio units.
+    const list = canonicalListFor(model, config, ctx);
+    const canonicalListUsd = list?.outputUsd;
 
     const wanted = resolvePerModel(provider.hostsPerModel, model, 1);
     const viable = selectMerchants(
       model,
       rows,
       provider,
-      canonicalListUsd,
+      list,
       config.blacklist,
     );
     const candidates = viable.filter((l) => !strikes.isStruck(l));
@@ -274,7 +281,7 @@ function collectCandidates(
       skippedModels.push(model);
       continue;
     }
-    models.push({ model, candidates, wanted, canonicalListUsd });
+    models.push({ model, candidates, wanted, canonicalListUsd, list });
   }
   // Two marketplace names mapped to one published model (a lapsed promo name
   // beside the live one) list the same merchants; a merchant kept under both
@@ -700,9 +707,11 @@ export async function processA7Provider(
 
       // Cheapest KEPT lane per model gets the plain channel; the rest are
       // failover duplicates so capAbove1x does not delete them as pricier copies.
-      const cheapestMicros = Math.min(
-        ...kept.map((k) => k.lane.listing.input_price_micros),
-      );
+      // AdoRouter: cheapest by cost share of list on the dearer side, which is
+      // what the lane is priced on.
+      const costOf = (l: Listing) =>
+        mc.list ? costShareOfList(l, mc.list) : l.input_price_micros;
+      const cheapest = Math.min(...kept.map((k) => costOf(k.lane.listing)));
       for (const k of kept)
         offers.push(
           buildLaneOffer(
@@ -712,7 +721,7 @@ export async function processA7Provider(
             k.lane,
             k.key,
             k.rateLimited,
-            k.lane.listing.input_price_micros === cheapestMicros,
+            costOf(k.lane.listing) === cheapest,
             mc.canonicalListUsd,
           ),
         );
